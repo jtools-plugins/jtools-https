@@ -220,10 +220,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             return
         }
         val updated = dialog.toSettings()
+        HttpUiSettingsStore.save(project, updated)
+        applySettings(updated)
+    }
+
+    fun applySettings(updated: HttpUiSettings) {
         val oldDefault = uiSettings.defaultTimeoutSeconds
         val oldLineMarkerEnabled = uiSettings.lineMarkerEnabled
         uiSettings = updated
-        HttpUiSettingsStore.save(project, updated)
         if (timeoutField.text.trim() == oldDefault.toString()) {
             timeoutField.text = updated.defaultTimeoutSeconds.toString()
         }

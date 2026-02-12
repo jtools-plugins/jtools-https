@@ -65,6 +65,13 @@ object HttpPluginContext {
         SwingUtilities.invokeLater { action.run() }
     }
 
+    fun updateSettings(project: Project, settings: HttpUiSettings) {
+        HttpUiSettingsStore.save(project, settings)
+        val sanitized = HttpUiSettingsStore.load(project)
+        val panel = states[project]?.panel ?: return
+        SwingUtilities.invokeLater { panel.applySettings(sanitized) }
+    }
+
     fun removeProject(project: Project) {
         states.remove(project)
         HttpUiSettingsStore.clearCache(project)

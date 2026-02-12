@@ -4,9 +4,25 @@
     <version>0.0.1</version>
     <vendor>lhstack</vendor>
 
-    <description>
-        Lightweight HTTP client with endpoint discovery and request history.
-    </description>
+    <description><![CDATA[
+        <p>Lightweight HTTP client with endpoint discovery and request history.</p>
+        <p><b>Usage / 使用手册</b></p>
+        <ol>
+            <li>Open the <b>HTTP Client</b> tool window (right side or View | Tool Windows).</li>
+            <li>Click the gutter icon on Spring Controller methods or use <i>Add to Call List</i> to generate a request; or create a new tab and enter the URL manually.</li>
+            <li>Fill params/headers/body and click <b>Send</b>. Save requests to organize them in groups.</li>
+        </ol>
+        <p><b>Response</b></p>
+        <ul>
+            <li>Raw/Render/Headers views, JSON/XML/HTML/image rendering, and cURL copy.</li>
+            <li>Auto-detects local server port from run logs; defaults to 8080 if not detected.</li>
+        </ul>
+        <p><b>使用提示</b></p>
+        <ul>
+            <li>支持从 Spring 注解与 Router Function 识别接口。</li>
+            <li>左侧接口列表支持分组、搜索、拖拽排序。</li>
+        </ul>
+    ]]></description>
 
     <change-notes><![CDATA[
     <p><b>v0.0.1</b></p>
@@ -26,6 +42,12 @@
             anchor="right"
             factoryClass="com.lhstack.https.HttpToolWindowFactory"
             icon="/icons/http_client_tab.svg"/>
+
+        <projectConfigurable
+            id="com.lhstack.https.settings"
+            displayName="HTTP Client"
+            groupId="other"
+            instance="com.lhstack.https.HttpSettingsConfigurable"/>
 
         <codeInsight.lineMarkerProvider
             language="JAVA"
