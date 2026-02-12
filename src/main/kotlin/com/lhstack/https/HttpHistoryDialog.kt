@@ -2,6 +2,11 @@ package com.lhstack.https
 
 import com.intellij.json.JsonFileType
 import com.intellij.ide.highlighter.XmlFileType
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.fileTypes.PlainTextFileType
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
@@ -80,27 +85,34 @@ class HttpHistoryDialog(
             }
         })
 
-        val clearButton = javax.swing.JButton("清空")
-        clearButton.addActionListener {
-            val confirm = Messages.showYesNoDialog(
-                project,
-                "确定清空历史记录？",
-                "清空历史",
-                null
-            )
-            if (confirm != Messages.YES) {
-                return@addActionListener
+        val clearAction = object : AnAction("清空", "清空历史记录", HttpIcons.clear) {
+            override fun actionPerformed(e: AnActionEvent) {
+                val confirm = Messages.showYesNoDialog(
+                    project,
+                    "确定清空历史记录？",
+                    "清空历史",
+                    null
+                )
+                if (confirm != Messages.YES) {
+                    return
+                }
+                onClearAll()
+                historyModel.clear()
+                historyList.clearSelection()
+                detailPanel.clearEntry()
             }
-            onClearAll()
-            historyModel.clear()
-            historyList.clearSelection()
-            detailPanel.clearEntry()
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
         }
-        val toolbar = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0))
-        toolbar.add(clearButton)
+        val toolbar = ActionManager.getInstance()
+            .createActionToolbar("HttpHistoryToolbar", DefaultActionGroup(clearAction), true)
+        toolbar.component.border = JBUI.Borders.empty(0, 2)
+        toolbar.targetComponent = historyList
 
         val leftPanel = JPanel(BorderLayout())
-        leftPanel.add(toolbar, BorderLayout.NORTH)
+        leftPanel.add(toolbar.component, BorderLayout.NORTH)
         leftPanel.add(JBScrollPane(historyList), BorderLayout.CENTER)
         leftPanel.preferredSize = JBUI.size(280, 400)
 

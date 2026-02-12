@@ -5,6 +5,7 @@ import com.intellij.icons.AllIcons
 import com.intellij.ide.highlighter.XmlFileType
 import com.intellij.json.JsonFileType
 import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -102,12 +103,46 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val methodBox = JComboBox(HTTP_METHODS)
     private val urlField = JBTextField()
     private val timeoutField = JBTextField(uiSettings.defaultTimeoutSeconds.toString())
-    private val sendButton = JButton("发送")
-    private val cancelButton = JButton("取消")
-    private val copyCurlButton = JButton("复制 cURL")
-    private val saveApiButton = JButton("保存接口")
-    private val historyButton = JButton("历史请求")
-    private val requestHistoryButton = JButton("历史")
+    private val sendAction = object : AnAction("发送", "发送请求", HttpIcons.send) {
+        override fun actionPerformed(e: AnActionEvent) {
+            sendCurrentRequest()
+        }
+
+        override fun update(e: AnActionEvent) {
+            val sending = isSending
+            e.presentation.isEnabled = !sending
+            e.presentation.description = if (sending) "发送中..." else "发送请求"
+        }
+
+        override fun getActionUpdateThread(): ActionUpdateThread {
+            return ActionUpdateThread.EDT
+        }
+    }
+    private val cancelAction = object : AnAction("取消", "取消请求", HttpIcons.cancel) {
+        override fun actionPerformed(e: AnActionEvent) {
+            cancelCurrentRequest()
+        }
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = isSending
+        }
+
+        override fun getActionUpdateThread(): ActionUpdateThread {
+            return ActionUpdateThread.EDT
+        }
+    }
+    private val copyCurlAction = simpleAction("复制 cURL", "复制为 cURL 命令", HttpIcons.copy) {
+        copyCurl()
+    }
+    private val saveApiAction = simpleAction("保存接口", "保存当前接口", HttpIcons.save) {
+        saveCurrentRequest()
+    }
+    private val historyAction = simpleAction("历史请求", "查看历史请求", HttpIcons.history) {
+        showHistoryDialog()
+    }
+    private val requestHistoryAction = simpleAction("历史", "查看当前请求历史", HttpIcons.historyRequest) {
+        showCurrentRequestHistory()
+    }
 
     private val pathParamsModel = DefaultTableModel(arrayOf("键", "值"), 0)
     private val paramsModel = DefaultTableModel(arrayOf("键", "值"), 0)
@@ -136,7 +171,22 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val responseRenderHtml = ResponseHtmlPanel()
     private val responseRenderImage = JBLabel()
     private val responseRenderInfo = JBLabel()
-    private val responseDownloadButton = JButton("保存文件")
+    private val responseDownloadAction = object : AnAction("保存文件", "保存响应文件", HttpIcons.download) {
+        override fun actionPerformed(e: AnActionEvent) {
+            saveResponseToFile()
+        }
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = responseDownloadEnabled
+        }
+
+        override fun getActionUpdateThread(): ActionUpdateThread {
+            return ActionUpdateThread.EDT
+        }
+    }
+    private var requestActionsToolbar: ActionToolbar? = null
+    private var responseActionsToolbar: ActionToolbar? = null
+    private var responseDownloadEnabled = false
     private lateinit var responseTabs: JBTabbedPane
 
     private var currentTab: HttpCallTab? = null
@@ -201,7 +251,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             responseRenderInfo.text = ""
             responseHeadersArea.text = ""
             responseRequestHeadersArea.text = ""
-            responseDownloadButton.isEnabled = false
+            setResponseDownloadEnabled(false)
         } finally {
             isLoading = false
         }
@@ -296,16 +346,18 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             }
         })
 
-        val newGroupButton = JButton("新建分组")
-        newGroupButton.addActionListener { createGroup(null) }
-        historyButton.addActionListener { showHistoryDialog() }
+        val newGroupAction = simpleAction("新建分组", "新建分组", HttpIcons.groupAdd) {
+            createGroup(null)
+        }
 
         val apiHeader = JPanel(BorderLayout(6, 0))
         apiHeader.add(JBLabel("接口列表"), BorderLayout.WEST)
-        val apiActions = JPanel(FlowLayout(FlowLayout.RIGHT, 4, 0))
-        apiActions.add(historyButton)
-        apiActions.add(newGroupButton)
-        apiHeader.add(apiActions, BorderLayout.EAST)
+        val apiActionsToolbar = buildActionToolbar(
+            "HttpApiActionsToolbar",
+            listOf(historyAction, newGroupAction),
+            apiHeader
+        )
+        apiHeader.add(apiActionsToolbar.component, BorderLayout.EAST)
 
         val apiTop = JPanel(BorderLayout(0, 6))
         apiTop.add(apiHeader, BorderLayout.NORTH)
@@ -356,13 +408,15 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         callTabsPane.setPopupGroup(buildTabPopupGroup(), "CallTabsPopup",true)
         callTabsPane.component.minimumSize = JBUI.size(120, 26)
         callTabsPane.component.preferredSize = JBUI.size(120, 26)
-        val newTabButton = JButton("新建")
-        newTabButton.isFocusable = false
-        newTabButton.addActionListener { createNewTab() }
-
         val tabBar = JPanel(BorderLayout(6, 0))
         tabBar.add(callTabsPane.component, BorderLayout.CENTER)
-        tabBar.add(newTabButton, BorderLayout.EAST)
+        val newTabAction = simpleAction("新建", "新建请求", HttpIcons.tabAdd) {
+            createNewTab()
+        }
+        val tabActionsToolbar = buildActionToolbar("HttpTabActionsToolbar", listOf(newTabAction), tabBar)
+        tabActionsToolbar.component.minimumSize = JBUI.size(32, 32)
+        tabActionsToolbar.component.preferredSize = JBUI.size(32, 32)
+        tabBar.add(tabActionsToolbar.component, BorderLayout.EAST)
 
         val requestLine = JPanel(BorderLayout(0, 6))
         val urlRow = JPanel(BorderLayout(6, 0))
@@ -391,22 +445,16 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         timeoutPanel.add(JBLabel("超时(s)"))
         timeoutPanel.add(timeoutField)
         actionPanel.add(timeoutPanel)
-        actionPanel.add(saveApiButton)
-        actionPanel.add(requestHistoryButton)
-        actionPanel.add(sendButton)
-        actionPanel.add(cancelButton)
-        actionPanel.add(copyCurlButton)
+        requestActionsToolbar = buildActionToolbar(
+            "HttpRequestActionsToolbar",
+            listOf(saveApiAction, requestHistoryAction, sendAction, cancelAction, copyCurlAction),
+            requestPanel
+        )
+        actionPanel.add(requestActionsToolbar!!.component)
         val actionRow = JPanel(BorderLayout())
         actionRow.add(actionPanel, BorderLayout.EAST)
         requestLine.add(urlRow, BorderLayout.NORTH)
         requestLine.add(actionRow, BorderLayout.SOUTH)
-
-        sendButton.addActionListener { sendCurrentRequest() }
-        cancelButton.addActionListener { cancelCurrentRequest() }
-        copyCurlButton.addActionListener { copyCurl() }
-        saveApiButton.addActionListener { saveCurrentRequest() }
-        requestHistoryButton.addActionListener { showCurrentRequestHistory() }
-        cancelButton.isEnabled = false
 
         val pathParamsPanel = createKeyValuePanel(pathParamsModel, "路径变量")
         val paramsPanel = createKeyValuePanel(paramsModel, "查询参数")
@@ -432,10 +480,13 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         responseRenderPanel.add(JBScrollPane(imagePanel), "image")
         val binaryPanel = JPanel(BorderLayout(0, 8))
         binaryPanel.add(responseRenderInfo, BorderLayout.NORTH)
-        binaryPanel.add(responseDownloadButton, BorderLayout.WEST)
+        responseActionsToolbar = buildActionToolbar(
+            "HttpResponseActionsToolbar",
+            listOf(responseDownloadAction),
+            binaryPanel
+        )
+        binaryPanel.add(responseActionsToolbar!!.component, BorderLayout.WEST)
         responseRenderPanel.add(binaryPanel, "binary")
-
-        responseDownloadButton.addActionListener { saveResponseToFile() }
 
         responseTabs = JBTabbedPane()
         responseTabs.addTab("原始", responseRawArea)
@@ -1482,7 +1533,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             responseRenderHtml.setHtml("")
             responseRenderImage.icon = null
             responseRenderInfo.text = ""
-            responseDownloadButton.isEnabled = false
+            setResponseDownloadEnabled(false)
             responseHeadersArea.text = ""
             responseRequestHeadersArea.text = ""
             responseRequestSummaryArea.text = ""
@@ -1518,7 +1569,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                 }
                 responseRenderInfo.text = "渲染中..."
                 responseRenderLayout.show(responseRenderPanel, "binary")
-                responseDownloadButton.isEnabled = false
+                setResponseDownloadEnabled(false)
                 renderResponseAsync()
             }
             RESPONSE_TAB_HEADERS_INDEX -> {
@@ -1684,16 +1735,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         table.emptyText.text = emptyText
         table.rowHeight = JBUI.scale(24)
         table.setShowGrid(false)
-        val addButton = JButton("添加")
-        val removeButton = JButton("移除")
-        addButton.addActionListener {
+        val addAction = simpleAction("添加", "添加一行", HttpIcons.add) {
             model.addRow(arrayOf("", ""))
             val row = model.rowCount - 1
             if (row >= 0) {
                 table.editCellAt(row, 0)
             }
         }
-        removeButton.addActionListener {
+        val removeAction = simpleAction("移除", "移除选中行", HttpIcons.remove) {
             val selected = table.selectedRows
             if (selected.isEmpty()) {
                 if (model.rowCount > 0) {
@@ -1703,13 +1752,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                 selected.sortedDescending().forEach { model.removeRow(it) }
             }
         }
-
-        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        toolbar.add(addButton)
-        toolbar.add(removeButton)
+        val toolbar = buildActionToolbar(
+            "HttpKeyValueToolbar",
+            listOf(addAction, removeAction),
+            table
+        )
 
         val panel = JPanel(BorderLayout(0, 6))
-        panel.add(toolbar, BorderLayout.NORTH)
+        panel.add(toolbar.component, BorderLayout.NORTH)
         panel.add(JBScrollPane(table), BorderLayout.CENTER)
         return panel
     }
@@ -1737,6 +1787,38 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         return field
     }
 
+    private fun buildActionToolbar(
+        place: String,
+        actions: List<AnAction>,
+        target: JComponent? = null
+    ): ActionToolbar {
+        val group = DefaultActionGroup()
+        actions.forEach { group.add(it) }
+        val toolbar = ActionManager.getInstance().createActionToolbar(place, group, true)
+        toolbar.component.border = JBUI.Borders.empty(0, 2)
+        if (target != null) {
+            toolbar.targetComponent = target
+        }
+        return toolbar
+    }
+
+    private fun simpleAction(
+        text: String,
+        description: String,
+        icon: Icon,
+        handler: () -> Unit
+    ): AnAction {
+        return object : AnAction(text, description, icon) {
+            override fun actionPerformed(e: AnActionEvent) {
+                handler()
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+    }
+
     private fun createCookiePanel(): JPanel {
         cookiesTable = JBTable(cookiesModel)
         cookiesTable.rowHeight = JBUI.scale(24)
@@ -1747,17 +1829,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         cookiesTable.columnModel.getColumn(5).cellEditor = booleanEditor
         cookiesTable.columnModel.getColumn(6).cellEditor = booleanEditor
 
-        val addButton = JButton("添加")
-        val removeButton = JButton("移除")
-        val clearButton = JButton("清空")
-        addButton.addActionListener {
+        val addAction = simpleAction("添加", "添加 Cookie", HttpIcons.add) {
             cookiesModel.addRow(arrayOf("", "", "", "/", "", "否", "否"))
             val row = cookiesModel.rowCount - 1
             if (row >= 0) {
                 cookiesTable.editCellAt(row, 0)
             }
         }
-        removeButton.addActionListener {
+        val removeAction = simpleAction("移除", "移除选中 Cookie", HttpIcons.remove) {
             val selected = cookiesTable.selectedRows
             if (selected.isEmpty()) {
                 if (cookiesModel.rowCount > 0) {
@@ -1768,7 +1847,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             }
             persistCookiesFromTable()
         }
-        clearButton.addActionListener {
+        val clearAction = simpleAction("清空", "清空 Cookie", HttpIcons.clear) {
             cookieEntries.clear()
             cookiesModel.setRowCount(0)
             HttpCookieStorage.clear(project)
@@ -1780,13 +1859,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             }
         }
 
-        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        toolbar.add(addButton)
-        toolbar.add(removeButton)
-        toolbar.add(clearButton)
+        val toolbar = buildActionToolbar(
+            "HttpCookieToolbar",
+            listOf(addAction, removeAction, clearAction),
+            cookiesTable
+        )
 
         val panel = JPanel(BorderLayout(0, 6))
-        panel.add(toolbar, BorderLayout.NORTH)
+        panel.add(toolbar.component, BorderLayout.NORTH)
         panel.add(JBScrollPane(cookiesTable), BorderLayout.CENTER)
         return panel
     }
@@ -2038,7 +2118,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private fun applyRenderResult(result: RenderResult) {
         responseRenderImage.icon = null
         responseRenderInfo.text = result.info
-        responseDownloadButton.isEnabled = result.downloadable
+        setResponseDownloadEnabled(result.downloadable)
         val isTruncated = currentResponse?.bodyTruncated == true
         when (result.kind) {
             RenderKind.TEXT -> {
@@ -2333,9 +2413,12 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun setSending(sending: Boolean) {
         isSending = sending
-        sendButton.isEnabled = !sending
-        cancelButton.isEnabled = sending
-        sendButton.text = if (sending) "发送中..." else "发送"
+        requestActionsToolbar?.updateActionsImmediately()
+    }
+
+    private fun setResponseDownloadEnabled(enabled: Boolean) {
+        responseDownloadEnabled = enabled
+        responseActionsToolbar?.updateActionsImmediately()
     }
 
 
@@ -2593,14 +2676,17 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                     column
                 )
             }
-            val button = JButton(fileButtonText(value as? String))
-            button.isFocusable = false
-            button.toolTipText = (value as? String)?.trim().orEmpty()
+            val label = JBLabel(fileButtonText(value as? String), HttpIcons.file, SwingConstants.LEFT)
+            label.border = JBUI.Borders.empty(0, 4)
+            label.toolTipText = (value as? String)?.trim().orEmpty()
             if (isSelected) {
-                button.background = table.selectionBackground
-                button.foreground = table.selectionForeground
+                label.background = table.selectionBackground
+                label.foreground = table.selectionForeground
+                label.isOpaque = true
+            } else {
+                label.isOpaque = false
             }
-            button
+            label
         }
 
         formDataTable.addMouseListener(object : MouseAdapter() {
@@ -2617,17 +2703,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             formDataTable.repaint()
         }
 
-        val addButton = JButton("添加")
-        val removeButton = JButton("移除")
-
-        addButton.addActionListener {
+        val addAction = simpleAction("添加", "添加表单项", HttpIcons.add) {
             formDataModel.addRow(arrayOf("", "", "文本"))
             val row = formDataModel.rowCount - 1
             if (row >= 0) {
                 formDataTable.editCellAt(row, 0)
             }
         }
-        removeButton.addActionListener {
+        val removeAction = simpleAction("移除", "移除选中项", HttpIcons.remove) {
             val selected = formDataTable.selectedRows
             if (selected.isEmpty()) {
                 if (formDataModel.rowCount > 0) {
@@ -2638,12 +2721,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             }
         }
 
-        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
-        toolbar.add(addButton)
-        toolbar.add(removeButton)
+        val toolbar = buildActionToolbar(
+            "HttpFormDataToolbar",
+            listOf(addAction, removeAction),
+            formDataTable
+        )
 
         val panel = JPanel(BorderLayout(0, 6))
-        panel.add(toolbar, BorderLayout.NORTH)
+        panel.add(toolbar.component, BorderLayout.NORTH)
         panel.add(JBScrollPane(formDataTable), BorderLayout.CENTER)
         return panel
     }
