@@ -66,7 +66,9 @@ data class HttpRequestDraft(
     var urlEncoded: MutableList<HttpKeyValue> = mutableListOf(),
     @XCollection(style = XCollection.Style.v2, elementName = "form")
     var formFields: MutableList<HttpFormField> = mutableListOf(),
-    var body: String? = null
+    var body: String? = null,
+    var preScript: String? = null,
+    var postScript: String? = null
 )
 
 @Tag("cookie")

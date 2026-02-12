@@ -12,12 +12,15 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileChooser.FileSaverDescriptor
+import com.intellij.openapi.fileTypes.FileType
+import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.fileTypes.PlainTextFileType
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressIndicator
@@ -157,6 +160,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val bodyCardLayout = CardLayout()
     private val bodyCardPanel = JPanel(bodyCardLayout)
     private val bodyArea = MultiLanguageTextField(JsonFileType.INSTANCE, project)
+    private val scriptFileType = resolveScriptFileType()
+    private val preScriptArea = MultiLanguageTextField(scriptFileType, project)
+    private val postScriptArea = MultiLanguageTextField(scriptFileType, project)
 
     private val responseSummary = JBLabel("暂无响应")
     private val responseRawArea = createViewerField()
@@ -242,6 +248,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             cookiesModel.setRowCount(0)
             cookieEntries.clear()
             bodyArea.text = ""
+            preScriptArea.text = ""
+            postScriptArea.text = ""
             responseRawArea.text = ""
             responseRenderArea.text = ""
             responseRenderJsonArea.text = ""
@@ -468,6 +476,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         requestTabs.addTab("请求头", headersPanel)
         requestTabs.addTab("请求体", bodyPanel)
         requestTabs.addTab("Cookie", cookiesPanel)
+        requestTabs.addTab("前置脚本", createScriptPanel(preScriptArea, ScriptPhase.PRE))
+        requestTabs.addTab("后置脚本", createScriptPanel(postScriptArea, ScriptPhase.POST))
 
         responseRenderHtml.isEditable = false
 
@@ -855,6 +865,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         setTableEntries(urlEncodedModel, tab.draft.urlEncoded)
         setFormFields(tab.draft.formFields)
         bodyArea.text = tab.draft.body ?: ""
+        preScriptArea.text = tab.draft.preScript ?: ""
+        postScriptArea.text = tab.draft.postScript ?: ""
         updateResponse(tabResponses[tab.id])
     }
 
@@ -1136,7 +1148,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             headers = draft.headers.map { HttpKeyValue(it.key, it.value) }.toMutableList(),
             urlEncoded = draft.urlEncoded.map { HttpKeyValue(it.key, it.value) }.toMutableList(),
             formFields = draft.formFields.map { HttpFormField(it.key, it.value, it.fieldType) }.toMutableList(),
-            body = draft.body
+            body = draft.body,
+            preScript = draft.preScript,
+            postScript = draft.postScript
         )
     }
 
@@ -1362,7 +1376,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             bodyType = bodyType.name,
             urlEncoded = urlEncoded,
             formFields = formFields,
-            body = body
+            body = body,
+            preScript = preScriptArea.text,
+            postScript = postScriptArea.text
         )
     }
 
@@ -1405,8 +1421,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (urlField.text.trim() != draft.url) {
             urlField.text = draft.url
         }
-        val runtimeDraft = resolveDraftForRequest(draft)
-        if (runtimeDraft.url.isBlank()) {
+        if (draft.url.isBlank()) {
             val error = HttpResponseSnapshot(
                 status = 0,
                 statusText = "URL 为空",
@@ -1417,10 +1432,10 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             )
             updateResponse(error)
             tabResponses[tab.id] = error
-            appendHistory(tab, runtimeDraft, error)
+            appendHistory(tab, draft, error)
             return
         }
-        executeRequest(tab, runtimeDraft)
+        executeRequest(tab, draft)
     }
 
     private fun copyCurl() {
@@ -1439,73 +1454,63 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private fun executeRequest(tab: HttpCallTab, draft: HttpRequestDraft) {
         setSending(true)
         val start = System.nanoTime()
+        val scriptVars = linkedMapOf<String, Any?>()
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, "HTTP 请求", true) {
             override fun run(indicator: ProgressIndicator) {
                 currentIndicator = indicator
-                indicator.text = "发送请求..."
+                indicator.text = "执行前置脚本..."
                 var snapshot: HttpResponseSnapshot? = null
                 var cookieMutations: List<CookieMutation> = emptyList()
+                var requestDraft = resolveDraftForRequest(draft)
                 try {
-                    val request = buildHttpRequest(draft)
-                    val client = buildHttpClient(sanitizeTimeoutSeconds(draft.timeoutSeconds))
-                    val future = client.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray())
-                    currentFuture = future
-                    while (!future.isDone) {
-                        if (indicator.isCanceled) {
-                            future.cancel(true)
-                            throw ProcessCanceledException()
-                        }
-                        Thread.sleep(100)
+                    val preScriptResult = runPreScript(requestDraft, scriptVars)
+                    if (preScriptResult.error != null) {
+                        snapshot = buildErrorSnapshot(
+                            preScriptResult.error,
+                            start,
+                            requestDraft
+                        )
+                    } else {
+                        requestDraft = resolveDraftForRequest(preScriptResult.draft)
                     }
-                    val response = future.get()
-                    cookieMutations = extractCookieMutations(response)
-                    snapshot = buildResponseSnapshot(response, start)
+                    if (snapshot == null) {
+                        indicator.text = "发送请求..."
+                        val request = buildHttpRequest(requestDraft)
+                        val client = buildHttpClient(sanitizeTimeoutSeconds(requestDraft.timeoutSeconds))
+                        val future = client.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray())
+                        currentFuture = future
+                        while (!future.isDone) {
+                            if (indicator.isCanceled) {
+                                future.cancel(true)
+                                throw ProcessCanceledException()
+                            }
+                            Thread.sleep(100)
+                        }
+                        val response = future.get()
+                        cookieMutations = extractCookieMutations(response)
+                        val responseSnapshot = buildResponseSnapshot(response, start)
+                        snapshot = responseSnapshot
+                        val postScriptResult = runPostScript(requestDraft, responseSnapshot, cookieMutations, scriptVars)
+                        snapshot = postScriptResult.snapshot
+                        cookieMutations = postScriptResult.cookieMutations
+                    }
                 } catch (e: ProcessCanceledException) {
-                    snapshot = HttpResponseSnapshot(
-                        status = 0,
-                        statusText = "已取消",
-                        durationMs = elapsedMs(start),
-                        sizeBytes = 0,
-                        requestMethod = draft.method,
-                        requestUrl = draft.url,
-                        requestParams = draft.params.toMutableList(),
-                        headers = mutableListOf(),
-                        body = "请求已取消"
-                    )
+                    snapshot = buildErrorSnapshot("请求已取消", start, requestDraft)
                 } catch (e: CancellationException) {
-                    snapshot = HttpResponseSnapshot(
-                        status = 0,
-                        statusText = "已取消",
-                        durationMs = elapsedMs(start),
-                        sizeBytes = 0,
-                        requestMethod = draft.method,
-                        requestUrl = draft.url,
-                        requestParams = draft.params.toMutableList(),
-                        headers = mutableListOf(),
-                        body = "请求已取消"
-                    )
+                    snapshot = buildErrorSnapshot("请求已取消", start, requestDraft)
                 } catch (e: Exception) {
-                    snapshot = HttpResponseSnapshot(
-                        status = 0,
-                        statusText = e.message ?: "请求失败",
-                        durationMs = elapsedMs(start),
-                        sizeBytes = 0,
-                        requestMethod = draft.method,
-                        requestUrl = draft.url,
-                        requestParams = draft.params.toMutableList(),
-                        headers = mutableListOf(),
-                        body = e.stackTraceToString()
-                    )
+                    snapshot = buildErrorSnapshot(e.message ?: "请求失败", start, requestDraft, e.stackTraceToString())
                 } finally {
                     currentFuture = null
                     currentIndicator = null
                 }
-                val finalSnapshot = snapshot
+                val finalSnapshot = snapshot ?: buildErrorSnapshot("请求失败", start, requestDraft)
                 val finalCookies = cookieMutations
+                val finalDraft = requestDraft
                 SwingUtilities.invokeLater {
                     updateResponse(finalSnapshot)
                     tabResponses[tab.id] = finalSnapshot
-                    appendHistory(tab, draft, finalSnapshot)
+                    appendHistory(tab, finalDraft, finalSnapshot)
                     if (finalCookies.isNotEmpty()) {
                         applyCookieMutations(finalCookies)
                     }
@@ -1517,6 +1522,351 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                 currentFuture?.cancel(true)
             }
         })
+    }
+
+    private fun runPreScript(
+        draft: HttpRequestDraft,
+        vars: MutableMap<String, Any?>
+    ): PreScriptResult {
+        val script = draft.preScript?.trim().orEmpty()
+        if (script.isBlank()) {
+            return PreScriptResult(draft = draft)
+        }
+        val logger = HttpScriptLogger(project)
+        val requestContext = toScriptRequestContext(draft)
+        val execution = executeScript(script, requestContext, null, vars, logger)
+        if (execution.isFailure) {
+            val throwable = execution.exceptionOrNull()
+            val message = scriptErrorMessage("前置脚本失败", throwable)
+            logger.error(message)
+            return PreScriptResult(draft = draft, error = message)
+        }
+        return PreScriptResult(draft = fromScriptRequestContext(draft, requestContext))
+    }
+
+    private fun runPostScript(
+        draft: HttpRequestDraft,
+        snapshot: HttpResponseSnapshot,
+        cookieMutations: List<CookieMutation>,
+        vars: MutableMap<String, Any?>
+    ): PostScriptResult {
+        val script = draft.postScript?.trim().orEmpty()
+        if (script.isBlank()) {
+            return PostScriptResult(snapshot = snapshot, cookieMutations = cookieMutations)
+        }
+        val logger = HttpScriptLogger(project)
+        val requestContext = toScriptRequestContext(draft)
+        val responseContext = toScriptResponseContext(snapshot, cookieMutations)
+        val execution = executeScript(script, requestContext, responseContext, vars, logger)
+        if (execution.isFailure) {
+            val throwable = execution.exceptionOrNull()
+            val message = scriptErrorMessage("后置脚本失败", throwable)
+            logger.error(message)
+            val nextStatusText = if (snapshot.statusText.isBlank()) {
+                message
+            } else {
+                "${snapshot.statusText} | $message"
+            }
+            return PostScriptResult(snapshot = snapshot.copy(statusText = nextStatusText), cookieMutations = cookieMutations)
+        }
+        val nextSnapshot = fromScriptResponseContext(snapshot, responseContext)
+        val nextMutations = toCookieMutations(responseContext, draft.url)
+        return PostScriptResult(snapshot = nextSnapshot, cookieMutations = nextMutations)
+    }
+
+    private fun executeScript(
+        script: String,
+        requestContext: HttpScriptRequestContext?,
+        responseContext: HttpScriptResponseContext?,
+        vars: MutableMap<String, Any?>,
+        logger: HttpScriptLogger
+    ): Result<Unit> {
+        val bindings = linkedMapOf<String, Any?>(
+            "request" to requestContext,
+            "response" to responseContext,
+            "env" to HttpScriptEnv(project),
+            "vars" to vars,
+            "store" to HttpScriptStore(project),
+            "jvm" to HttpScriptJvmBridge(project, logger),
+            "logger" to logger,
+            "projectHash" to project.locationHash
+        )
+        val wrappedScript = buildString {
+            appendLine("var log = function(message) { logger.info(message); };")
+            appendLine("log.info = function(message) { logger.info(message); };")
+            appendLine("log.debug = function(message) { logger.debug(message); };")
+            appendLine("log.warn = function(message) { logger.warn(message); };")
+            appendLine("log.error = function(message) { logger.error(message); };")
+            appendLine("var debug = function(message) { logger.debug(message); };")
+            appendLine("var warn = function(message) { logger.warn(message); };")
+            appendLine("var error = function(message) { logger.error(message); };")
+            appendLine(script)
+        }
+        return HttpScriptEngine.execute(wrappedScript, bindings, SCRIPT_TIMEOUT_MS)
+    }
+
+    private fun buildErrorSnapshot(
+        statusText: String,
+        start: Long,
+        draft: HttpRequestDraft,
+        body: String? = null
+    ): HttpResponseSnapshot {
+        return HttpResponseSnapshot(
+            status = 0,
+            statusText = statusText,
+            durationMs = elapsedMs(start),
+            sizeBytes = 0,
+            requestMethod = draft.method,
+            requestUrl = draft.url,
+            requestParams = draft.params.toMutableList(),
+            headers = mutableListOf(),
+            body = body ?: statusText
+        )
+    }
+
+    private fun toScriptRequestContext(draft: HttpRequestDraft): HttpScriptRequestContext {
+        val headers = entriesToMap(draft.headers)
+        val cookies = linkedMapOf<String, String>()
+        val explicitCookieHeader = removeHeaderIgnoreCase(headers, "Cookie")
+        if (!explicitCookieHeader.isNullOrBlank()) {
+            cookies.putAll(parseCookieHeader(explicitCookieHeader))
+        }
+        if (cookies.isEmpty()) {
+            val persistedCookieHeader = buildCookieHeader(draft.url)
+            if (!persistedCookieHeader.isNullOrBlank()) {
+                cookies.putAll(parseCookieHeader(persistedCookieHeader))
+            }
+        }
+        val formData = draft.formFields.map { field ->
+            HttpScriptFormField(
+                key = field.key,
+                value = field.value,
+                type = parseFormFieldType(field.fieldType).name
+            )
+        }.toMutableList()
+        return HttpScriptRequestContext(
+            method = draft.method,
+            url = draft.url,
+            timeoutSeconds = sanitizeTimeoutSeconds(draft.timeoutSeconds),
+            pathParams = entriesToMap(draft.pathParams),
+            params = entriesToMap(draft.params),
+            headers = headers,
+            cookies = cookies,
+            bodyMode = parseBodyType(draft.bodyType).name,
+            jsonBody = draft.body,
+            urlEncoded = entriesToMap(draft.urlEncoded),
+            formData = formData
+        )
+    }
+
+    private fun fromScriptRequestContext(
+        draft: HttpRequestDraft,
+        context: HttpScriptRequestContext
+    ): HttpRequestDraft {
+        val bodyType = parseScriptBodyType(context.bodyMode)
+        val headerMap = LinkedHashMap(context.headers)
+        removeHeaderIgnoreCase(headerMap, "Cookie")
+        val headers = mapToEntries(headerMap)
+        val cookieHeader = buildCookieHeader(context.cookies)
+        if (!cookieHeader.isNullOrBlank()) {
+            headers.add(HttpKeyValue("Cookie", cookieHeader))
+        }
+        val timeout = if (context.timeoutSeconds > 0) {
+            sanitizeTimeoutSeconds(context.timeoutSeconds)
+        } else {
+            sanitizeTimeoutSeconds(draft.timeoutSeconds)
+        }
+        val method = context.method.trim().uppercase().ifBlank { draft.method }
+        val url = context.url.trim().ifBlank { draft.url }
+        val body = if (bodyType == HttpBodyType.JSON) context.jsonBody else null
+        val urlEncoded = if (bodyType == HttpBodyType.FORM_URLENCODED) {
+            mapToEntries(context.urlEncoded)
+        } else {
+            mutableListOf()
+        }
+        val formData = if (bodyType == HttpBodyType.FORM_DATA) {
+            context.formData.map { field ->
+                HttpFormField(
+                    key = field.key,
+                    value = field.value,
+                    fieldType = parseFormFieldType(field.type).name
+                )
+            }.toMutableList()
+        } else {
+            mutableListOf()
+        }
+        return draft.copy(
+            method = method,
+            url = url,
+            timeoutSeconds = timeout,
+            pathParams = mapToEntries(context.pathParams),
+            params = mapToEntries(context.params),
+            headers = headers,
+            bodyType = bodyType.name,
+            urlEncoded = urlEncoded,
+            formFields = formData,
+            body = body
+        )
+    }
+
+    private fun toScriptResponseContext(
+        snapshot: HttpResponseSnapshot,
+        cookieMutations: List<CookieMutation>
+    ): HttpScriptResponseContext {
+        val cookies = cookieMutations.map { mutation ->
+            HttpScriptCookie(
+                name = mutation.entry.name,
+                value = mutation.entry.value,
+                domain = mutation.entry.domain,
+                path = mutation.entry.path,
+                expiresAt = mutation.entry.expiresAt,
+                secure = mutation.entry.secure,
+                httpOnly = mutation.entry.httpOnly,
+                remove = mutation.remove
+            )
+        }.toMutableList()
+        return HttpScriptResponseContext(
+            status = snapshot.status,
+            statusText = snapshot.statusText,
+            headers = entriesToMap(snapshot.headers),
+            body = snapshot.body,
+            bodyBase64 = snapshot.bodyBase64,
+            cookies = cookies
+        )
+    }
+
+    private fun fromScriptResponseContext(
+        snapshot: HttpResponseSnapshot,
+        context: HttpScriptResponseContext
+    ): HttpResponseSnapshot {
+        val headers = mapToEntries(context.headers)
+        val contentType = getHeaderIgnoreCase(context.headers, "Content-Type").orEmpty()
+        val contentEncoding = getHeaderIgnoreCase(context.headers, "Content-Encoding").orEmpty()
+        val body = context.body
+        val bodyBase64 = if (!body.isNullOrBlank()) null else context.bodyBase64
+        return snapshot.copy(
+            status = context.status,
+            statusText = context.statusText,
+            sizeBytes = estimateBodySize(body, bodyBase64, snapshot.sizeBytes),
+            contentType = contentType,
+            contentEncoding = contentEncoding,
+            encodingUnsupported = false,
+            bodyTruncated = false,
+            headers = headers,
+            body = body,
+            bodyBase64 = bodyBase64
+        )
+    }
+
+    private fun toCookieMutations(
+        context: HttpScriptResponseContext,
+        requestUrl: String
+    ): List<CookieMutation> {
+        val uri = runCatching { URI(normalizeUrl(requestUrl)) }.getOrNull()
+        val host = uri?.host.orEmpty()
+        return context.cookies
+            .filter { it.name.isNotBlank() }
+            .map { cookie ->
+                val entry = HttpCookieEntry(
+                    name = cookie.name,
+                    value = cookie.value,
+                    domain = cookie.domain.ifBlank { host },
+                    path = cookie.path.ifBlank { "/" },
+                    expiresAt = cookie.expiresAt,
+                    secure = cookie.secure,
+                    httpOnly = cookie.httpOnly
+                )
+                CookieMutation(entry, cookie.remove)
+            }
+    }
+
+    private fun entriesToMap(entries: List<HttpKeyValue>): MutableMap<String, String> {
+        val map = linkedMapOf<String, String>()
+        entries.forEach { entry ->
+            val key = entry.key.trim()
+            if (key.isNotBlank()) {
+                map[key] = entry.value
+            }
+        }
+        return map
+    }
+
+    private fun mapToEntries(values: Map<String, String>): MutableList<HttpKeyValue> {
+        return values.entries
+            .mapNotNull { entry ->
+                val key = entry.key.trim()
+                if (key.isBlank()) null else HttpKeyValue(key, entry.value)
+            }
+            .toMutableList()
+    }
+
+    private fun removeHeaderIgnoreCase(headers: MutableMap<String, String>, name: String): String? {
+        val key = headers.keys.firstOrNull { it.equals(name, ignoreCase = true) } ?: return null
+        return headers.remove(key)
+    }
+
+    private fun getHeaderIgnoreCase(headers: Map<String, String>, name: String): String? {
+        val key = headers.keys.firstOrNull { it.equals(name, ignoreCase = true) } ?: return null
+        return headers[key]
+    }
+
+    private fun parseCookieHeader(value: String): MutableMap<String, String> {
+        val cookies = linkedMapOf<String, String>()
+        value.split(";").forEach { raw ->
+            val part = raw.trim()
+            if (part.isBlank()) {
+                return@forEach
+            }
+            val index = part.indexOf('=')
+            if (index <= 0) {
+                return@forEach
+            }
+            val name = part.substring(0, index).trim()
+            if (name.isBlank()) {
+                return@forEach
+            }
+            val cookieValue = part.substring(index + 1).trim()
+            cookies[name] = cookieValue
+        }
+        return cookies
+    }
+
+    private fun buildCookieHeader(cookies: Map<String, String>): String? {
+        if (cookies.isEmpty()) {
+            return null
+        }
+        val values = cookies.entries
+            .filter { it.key.isNotBlank() }
+            .map { "${it.key}=${it.value}" }
+        if (values.isEmpty()) {
+            return null
+        }
+        return values.joinToString("; ")
+    }
+
+    private fun estimateBodySize(body: String?, bodyBase64: String?, fallback: Long): Long {
+        if (!body.isNullOrBlank()) {
+            return body.toByteArray(StandardCharsets.UTF_8).size.toLong()
+        }
+        if (!bodyBase64.isNullOrBlank()) {
+            val bytes = decodeBase64(bodyBase64)
+            if (bytes != null) {
+                return bytes.size.toLong()
+            }
+        }
+        return fallback
+    }
+
+    private fun scriptErrorMessage(prefix: String, throwable: Throwable?): String {
+        if (throwable == null) {
+            return prefix
+        }
+        val message = throwable.message?.trim().orEmpty()
+        return if (message.isBlank()) {
+            prefix
+        } else {
+            "$prefix: $message"
+        }
     }
 
     private fun updateResponse(response: HttpResponseSnapshot?) {
@@ -1762,6 +2112,116 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         panel.add(toolbar.component, BorderLayout.NORTH)
         panel.add(JBScrollPane(table), BorderLayout.CENTER)
         return panel
+    }
+
+    private fun createScriptPanel(editor: MultiLanguageTextField, phase: ScriptPhase): JPanel {
+        val baseHint = when (phase) {
+            ScriptPhase.PRE -> "发送前执行 JavaScript，可修改 request / vars。"
+            ScriptPhase.POST -> "响应后执行 JavaScript，可修改 response / vars / cookies。"
+        }
+        val hint = if (scriptFileType == PlainTextFileType.INSTANCE) {
+            "$baseHint 当前 IDE 未检测到 JS 高亮能力，将以纯文本编辑。"
+        } else {
+            "$baseHint 可用对象：request / response / env / vars / store / jvm / log。"
+        }
+        val header = JPanel(BorderLayout(0, 4))
+        val hintLabel = JBLabel(hint).apply {
+            toolTipText = hint
+        }
+        header.add(hintLabel, BorderLayout.NORTH)
+        val envAction = object : AnAction("环境变量", "配置全局环境和项目环境", HttpIcons.scriptEnv) {
+            override fun actionPerformed(e: AnActionEvent) {
+                ScriptEnvDialog(project).show()
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+        val helpAction = object : AnAction("说明", "查看脚本 API 与返回约定", HttpIcons.scriptHelp) {
+            override fun actionPerformed(e: AnActionEvent) {
+                ScriptHelpDialog(project, phase).show()
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+        val templateAction = object : AnAction("示例", "插入脚本示例", HttpIcons.scriptTemplate) {
+            override fun actionPerformed(e: AnActionEvent) {
+                val template = if (phase == ScriptPhase.PRE) PRE_SCRIPT_TEMPLATE else POST_SCRIPT_TEMPLATE
+                val current = editor.text.trim()
+                val replace = current.isNotEmpty() &&
+                    Messages.showYesNoDialog(
+                        project,
+                        "脚本编辑器已有内容，是否覆盖为示例？\n选择“否”将追加到末尾。",
+                        "插入脚本示例",
+                        null
+                    ) == Messages.YES
+                insertScriptText(editor, template, replace)
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+        val snippetAction = object : AnAction("片段", "插入变量/函数片段", HttpIcons.scriptSnippet) {
+            override fun actionPerformed(e: AnActionEvent) {
+                val snippets = if (phase == ScriptPhase.PRE) PRE_SCRIPT_SNIPPETS else POST_SCRIPT_SNIPPETS
+                if (snippets.isEmpty()) {
+                    return
+                }
+                val labels = snippets.map { it.title }.toTypedArray()
+                val chooser = ScriptSnippetDialog(project, labels)
+                if (!chooser.showAndGet()) {
+                    return
+                }
+                val selected = chooser.selectedIndex
+                if (selected < 0 || selected >= snippets.size) {
+                    return
+                }
+                insertScriptText(editor, snippets[selected].content, false)
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+        val toolbar = buildActionToolbar("HttpScriptToolbar", listOf(envAction, helpAction, templateAction, snippetAction), editor)
+        val toolbarWrap = JPanel(BorderLayout())
+        toolbarWrap.add(toolbar.component, BorderLayout.EAST)
+        header.add(toolbarWrap, BorderLayout.SOUTH)
+
+        val panel = JPanel(BorderLayout(0, 6))
+        panel.add(header, BorderLayout.NORTH)
+        panel.add(editor, BorderLayout.CENTER)
+        return panel
+    }
+
+    private fun resolveScriptFileType(): FileType {
+        return runCatching {
+            FileTypeManager.getInstance().getFileTypeByExtension("js")
+        }.getOrNull()?.takeIf { it != PlainTextFileType.INSTANCE } ?: PlainTextFileType.INSTANCE
+    }
+
+    private fun insertScriptText(editor: MultiLanguageTextField, content: String, replace: Boolean) {
+        if (content.isBlank()) {
+            return
+        }
+        val document = editor.document
+        val insertContent = if (replace || document.textLength == 0) {
+            content
+        } else {
+            val prefix = if (document.text.endsWith("\n")) "" else "\n\n"
+            prefix + content
+        }
+        WriteCommandAction.runWriteCommandAction(project) {
+            if (replace || document.textLength == 0) {
+                document.setText(insertContent)
+            } else {
+                document.insertString(document.textLength, insertContent)
+            }
+        }
     }
 
     private fun createViewerField(): EditorTextField {
@@ -2791,6 +3251,17 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
+    private fun parseScriptBodyType(value: String): HttpBodyType {
+        val normalized = value.trim().uppercase()
+        return when (normalized) {
+            "JSON" -> HttpBodyType.JSON
+            "FORM_URLENCODED", "X-WWW-FORM-URLENCODED", "FORM-URLENCODED" -> HttpBodyType.FORM_URLENCODED
+            "FORM_DATA", "FORM-DATA" -> HttpBodyType.FORM_DATA
+            "NONE", "" -> HttpBodyType.NONE
+            else -> parseBodyType(normalized)
+        }
+    }
+
     private fun resolveTimeoutSeconds(value: String): Int {
         val parsed = value.trim().toIntOrNull() ?: uiSettings.defaultTimeoutSeconds
         return sanitizeTimeoutSeconds(parsed)
@@ -2931,6 +3402,16 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         val port = HttpPluginContext.getPort(project) ?: 8080
         return "http://localhost:$port/"
     }
+
+    private data class PreScriptResult(
+        val draft: HttpRequestDraft,
+        val error: String? = null
+    )
+
+    private data class PostScriptResult(
+        val snapshot: HttpResponseSnapshot,
+        val cookieMutations: List<CookieMutation>
+    )
 
     private data class UrlParts(
         val baseUrl: String,
@@ -3250,6 +3731,177 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
+    private inner class ScriptEnvDialog(
+        project: Project
+    ) : DialogWrapper(project) {
+        private val projectModel = DefaultTableModel(arrayOf("键", "值"), 0)
+        private val globalModel = DefaultTableModel(arrayOf("键", "值"), 0)
+
+        init {
+            title = "环境变量"
+            loadModel(projectModel, HttpScriptEnvStore.loadProject(project))
+            loadModel(globalModel, HttpScriptEnvStore.loadGlobal())
+            init()
+        }
+
+        override fun createCenterPanel(): JComponent {
+            val tabs = JBTabbedPane()
+            tabs.addTab("项目环境", createEnvPanel(projectModel))
+            tabs.addTab("全局环境", createEnvPanel(globalModel))
+            return JPanel(BorderLayout(0, 8)).apply {
+                preferredSize = JBUI.size(680, 460)
+                add(JBLabel("读取优先级：项目环境 > 全局环境"), BorderLayout.NORTH)
+                add(tabs, BorderLayout.CENTER)
+            }
+        }
+
+        override fun doOKAction() {
+            val projectValues = readModel(projectModel)
+            val globalValues = readModel(globalModel)
+            HttpScriptEnvStore.saveProject(project, projectValues)
+            HttpScriptEnvStore.saveGlobal(globalValues)
+            super.doOKAction()
+        }
+
+        private fun createEnvPanel(model: DefaultTableModel): JPanel {
+            val table = JBTable(model)
+            table.rowHeight = JBUI.scale(24)
+            table.setShowGrid(false)
+            table.emptyText.text = "暂无变量"
+
+            val addAction = simpleAction("添加", "添加变量", HttpIcons.add) {
+                model.addRow(arrayOf("", ""))
+                val row = model.rowCount - 1
+                if (row >= 0) {
+                    table.editCellAt(row, 0)
+                }
+            }
+            val removeAction = simpleAction("移除", "移除选中变量", HttpIcons.remove) {
+                val selected = table.selectedRows
+                if (selected.isEmpty()) {
+                    if (model.rowCount > 0) {
+                        model.removeRow(model.rowCount - 1)
+                    }
+                } else {
+                    selected.sortedDescending().forEach { model.removeRow(it) }
+                }
+            }
+            val clearAction = simpleAction("清空", "清空当前页签变量", HttpIcons.clear) {
+                model.setRowCount(0)
+            }
+            val toolbar = buildActionToolbar(
+                "HttpScriptEnvToolbar",
+                listOf(addAction, removeAction, clearAction),
+                table
+            )
+            return JPanel(BorderLayout(0, 6)).apply {
+                add(toolbar.component, BorderLayout.NORTH)
+                add(JBScrollPane(table), BorderLayout.CENTER)
+            }
+        }
+
+        private fun loadModel(model: DefaultTableModel, values: Map<String, String>) {
+            model.setRowCount(0)
+            values.entries.sortedBy { it.key }.forEach { (key, value) ->
+                model.addRow(arrayOf(key, value))
+            }
+        }
+
+        private fun readModel(model: DefaultTableModel): Map<String, String> {
+            val result = linkedMapOf<String, String>()
+            for (row in 0 until model.rowCount) {
+                val key = (model.getValueAt(row, 0) as? String)?.trim().orEmpty()
+                val value = (model.getValueAt(row, 1) as? String)?.trim().orEmpty()
+                if (key.isNotBlank() && value.isNotBlank()) {
+                    result[key] = value
+                }
+            }
+            return result
+        }
+    }
+
+    private inner class ScriptHelpDialog(
+        project: Project,
+        private val phase: ScriptPhase
+    ) : DialogWrapper(project) {
+        init {
+            title = if (phase == ScriptPhase.PRE) "前置脚本说明" else "后置脚本说明"
+            init()
+        }
+
+        override fun createCenterPanel(): JComponent {
+            val apiField = createViewerField()
+            apiField.text = SCRIPT_API_DOC
+            apiField.setCaretPosition(0)
+
+            val phaseField = createViewerField()
+            phaseField.text = if (phase == ScriptPhase.PRE) PRE_SCRIPT_DOC else POST_SCRIPT_DOC
+            phaseField.setCaretPosition(0)
+
+            val sampleField = createViewerField()
+            sampleField.text = if (phase == ScriptPhase.PRE) PRE_SCRIPT_TEMPLATE else POST_SCRIPT_TEMPLATE
+            sampleField.setCaretPosition(0)
+
+            val tabs = JBTabbedPane()
+            tabs.addTab("通用 API", apiField)
+            tabs.addTab("当前阶段", phaseField)
+            tabs.addTab("示例", sampleField)
+
+            return JPanel(BorderLayout()).apply {
+                preferredSize = JBUI.size(760, 560)
+                add(tabs, BorderLayout.CENTER)
+            }
+        }
+    }
+
+    private inner class ScriptSnippetDialog(
+        project: Project,
+        options: Array<String>
+    ) : DialogWrapper(project) {
+        private val list = JBList(*options)
+        var selectedIndex: Int = -1
+            private set
+
+        init {
+            title = "脚本片段"
+            list.selectionMode = ListSelectionModel.SINGLE_SELECTION
+            if (options.isNotEmpty()) {
+                list.selectedIndex = 0
+            }
+            list.addMouseListener(object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) {
+                    if (e.clickCount == 2 && list.selectedIndex >= 0) {
+                        doOKAction()
+                    }
+                }
+            })
+            init()
+        }
+
+        override fun createCenterPanel(): JComponent {
+            return JPanel(BorderLayout(0, 6)).apply {
+                preferredSize = JBUI.size(420, 260)
+                add(JBLabel("选择要插入的片段"), BorderLayout.NORTH)
+                add(JBScrollPane(list), BorderLayout.CENTER)
+            }
+        }
+
+        override fun doOKAction() {
+            selectedIndex = list.selectedIndex
+            super.doOKAction()
+        }
+    }
+
+    private enum class ScriptPhase {
+        PRE,
+        POST
+    }
+
+    private data class ScriptSnippet(
+        val title: String,
+        val content: String
+    )
+
     private data class BodyTypeOption(val label: String, val type: HttpBodyType) {
         override fun toString(): String {
             return label
@@ -3264,10 +3916,170 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             BodyTypeOption("x-www-form-urlencoded", HttpBodyType.FORM_URLENCODED),
             BodyTypeOption("form-data", HttpBodyType.FORM_DATA)
         )
+        private val PRE_SCRIPT_SNIPPETS = listOf(
+            ScriptSnippet("读取环境变量", "var token = env.get(\"token\");\nif (token) {\n  request.headers.Authorization = \"Bearer \" + token;\n}"),
+            ScriptSnippet("设置临时变量 vars", "vars.traceId = \"trace-\" + Date.now();\nrequest.headers[\"X-Trace-Id\"] = vars.traceId;"),
+            ScriptSnippet("调用项目依赖 AES", "var AES = jvm.type(\"com.company.common.crypto.AES\");\nvar encryptor = AES.ECB.buildEncrypt(env.get(\"key\"));\nvar result = encryptor.getBase64(env.get(\"plain\"));\nif (result && result.data) {\n  vars.cipher = result.data;\n} else {\n  vars.cipher = String(result);\n}"),
+            ScriptSnippet("切换 bodyMode 到 JSON", "request.bodyMode = \"JSON\";\nrequest.jsonBody = JSON.stringify({ id: 1, name: \"demo\" });"),
+            ScriptSnippet("切换 bodyMode 到 x-www-form-urlencoded", "request.bodyMode = \"FORM_URLENCODED\";\nrequest.urlEncoded = { grant_type: \"client_credentials\", scope: \"read\" };"),
+            ScriptSnippet("切换 bodyMode 到 form-data", "request.bodyMode = \"FORM_DATA\";\nrequest.formData = [\n  { key: \"name\", value: \"demo\", type: \"TEXT\" },\n  { key: \"file\", value: \"/tmp/a.txt\", type: \"FILE\" }\n];"),
+            ScriptSnippet("设置 Cookie", "request.cookies.session = \"abc123\";\nrequest.cookies.locale = \"zh-CN\";"),
+            ScriptSnippet("持久化到项目环境变量", "store.setProject(\"token\", \"xxx\");\nlog(\"token 已写入项目环境变量\");")
+        )
+        private val POST_SCRIPT_SNIPPETS = listOf(
+            ScriptSnippet("读取响应并保存 vars", "if (response.status === 200 && response.body) {\n  var data = JSON.parse(response.body);\n  vars.userId = data.id;\n}"),
+            ScriptSnippet("写回响应头/响应体", "response.headers[\"X-Handled-By\"] = \"jtools-script\";\nresponse.body = response.body || \"\";"),
+            ScriptSnippet("保存 token 到项目环境变量", "if (response.body) {\n  var data = JSON.parse(response.body);\n  if (data.token) {\n    store.setProject(\"token\", data.token);\n  }\n}"),
+            ScriptSnippet("处理 Set-Cookie", "response.cookies.push({\n  name: \"session\",\n  value: \"new-value\",\n  domain: \"\",\n  path: \"/\",\n  expiresAt: 0,\n  secure: false,\n  httpOnly: true,\n  remove: false\n});"),
+            ScriptSnippet("删除 Cookie", "response.cookies.push({\n  name: \"session\",\n  value: \"\",\n  domain: \"\",\n  path: \"/\",\n  expiresAt: 0,\n  secure: false,\n  httpOnly: false,\n  remove: true\n});")
+        )
+        private val SCRIPT_API_DOC = """
+            【执行约定】
+            - 前置脚本：发送 HTTP 请求之前执行
+            - 后置脚本：拿到响应之后执行
+            - 返回值：脚本 return 值会被忽略，不需要 return
+            - 生效方式：直接修改 request / response / vars 对象
+            - 超时：脚本执行超时会报错并写入状态信息
+
+            【可用对象】
+            1) request (前置可用，后置只读参考)
+               method: String
+               url: String
+               timeoutSeconds: Number
+               pathParams: Map<String, String>
+               params: Map<String, String>
+               headers: Map<String, String>
+               cookies: Map<String, String>
+               bodyMode: String，可选 NONE / JSON / FORM_URLENCODED / FORM_DATA
+               jsonBody: String | null
+               urlEncoded: Map<String, String>
+               formData: Array<{key,value,type}>，type 可选 TEXT / FILE
+
+            2) response (仅后置可用)
+               status: Number
+               statusText: String
+               headers: Map<String, String>
+               body: String | null
+               bodyBase64: String | null
+               cookies: Array<{name,value,domain,path,expiresAt,secure,httpOnly,remove}>
+
+            3) env (只读环境变量)
+               env.get(key): String | null
+               env.getProject(key): String | null
+               env.getGlobal(key): String | null
+               env.all(): Map<String, String>
+               读取优先级：project > global
+               设置入口：脚本页签右上角“环境变量”按钮
+
+            4) vars (临时变量)
+               - 类型：Map
+               - 生命周期：仅本次请求
+               - 用途：前置脚本和后置脚本之间传值
+
+            5) store (持久化变量写入)
+               store.get(key): String | null
+               store.getProject(key): String | null
+               store.getGlobal(key): String | null
+               store.setProject(key, value): void
+               store.setGlobal(key, value): void
+               store.removeProject(key): void
+               store.removeGlobal(key): void
+
+            6) 日志函数
+               log(message): void
+               log.info(message): void
+               log.debug(message): void
+               log.warn(message): void
+               log.error(message): void
+               debug(message): void
+               warn(message): void
+               error(message): void
+
+            7) jvm (调用项目依赖类)
+               jvm.type("com.xxx.ClassName"): 可直接调用静态方法的类对象
+               jvm.available("com.xxx.ClassName"): boolean
+               jvm.classpath(): Array<String>
+               示例：
+               var AES = jvm.type("com.company.common.crypto.AES");
+               var encryptor = AES.ECB.buildEncrypt(env.get("key"));
+               var result = encryptor.getBase64();
+               vars.cipher = result && result.data ? result.data : String(result);
+        """.trimIndent()
+        private val PRE_SCRIPT_DOC = """
+            【前置脚本入参】
+            - request: 可读可写
+            - env: 只读
+            - vars: 可读可写
+            - store: 可读可写
+            - jvm: 可读（用于加载项目 classpath 类）
+            - log/debug/warn/error
+
+            【前置脚本返回值】
+            - 无需返回，return 会被忽略
+            - 通过修改 request 对象生效
+
+            【前置脚本建议】
+            - URL、Header、Query、Cookie、Body 在这里统一处理
+            - bodyMode 和 body 数据结构要匹配
+            - 需要项目依赖能力时，用 jvm.type("全限定类名")
+        """.trimIndent()
+        private val POST_SCRIPT_DOC = """
+            【后置脚本入参】
+            - request: 只读参考
+            - response: 可读可写
+            - env: 只读
+            - vars: 可读可写
+            - store: 可读可写
+            - jvm: 可读（用于加载项目 classpath 类）
+            - log/debug/warn/error
+
+            【后置脚本返回值】
+            - 无需返回，return 会被忽略
+            - 通过修改 response 对象和 response.cookies 生效
+
+            【后置脚本建议】
+            - 解析响应体后保存 token 到 store
+            - 按业务规则重写响应头/响应体
+            - 用 vars 承接前置脚本生成的上下文
+        """.trimIndent()
+        private val PRE_SCRIPT_TEMPLATE = """
+            // 前置脚本示例：发送前动态改写请求
+            var token = env.get("token");
+            if (token) {
+              request.headers.Authorization = "Bearer " + token;
+            }
+
+            vars.traceId = "trace-" + Date.now();
+            request.headers["X-Trace-Id"] = vars.traceId;
+
+            // 根据 bodyMode 设置请求体
+            request.bodyMode = "JSON";
+            request.jsonBody = JSON.stringify({
+              name: "demo",
+              timestamp: Date.now()
+            });
+
+            log("pre done, url=" + request.url);
+        """.trimIndent()
+        private val POST_SCRIPT_TEMPLATE = """
+            // 后置脚本示例：处理响应并落库变量
+            log("post status=" + response.status);
+
+            if (response.status === 200 && response.body) {
+              var data = JSON.parse(response.body);
+              if (data.token) {
+                store.setProject("token", data.token);
+              }
+            }
+
+            // 也可以改写响应内容（用于视图展示）
+            response.headers["X-Handled-By"] = "script";
+        """.trimIndent()
         private const val MAX_TIMEOUT_SECONDS = 120
         private const val MAX_BODY_BYTES = 1_000_000
         private const val MIN_PREVIEW_CHARS = 1000
         private const val MAX_PREVIEW_CHARS = 2_000_000
+        private const val SCRIPT_TIMEOUT_MS = 1_000L
         private const val RESPONSE_TAB_RAW_INDEX = 0
         private const val RESPONSE_TAB_RENDER_INDEX = 1
         private const val RESPONSE_TAB_HEADERS_INDEX = 2

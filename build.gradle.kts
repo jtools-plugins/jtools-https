@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.lhstack"
-version = "0.0.1"
+version = "0.0.2"
 
 
 repositories {
@@ -26,6 +26,7 @@ dependencies {
         // Avoid bundling slf4j classes into the plugin jar; let the IDE provide them.
         exclude(group = "org.slf4j", module = "slf4j-api")
     }
+    implementation("org.openjdk.nashorn:nashorn-core:15.6")
     intellijPlatform{
         intellijIdeaCommunity("2022.3")
         bundledPlugin("com.intellij.java")

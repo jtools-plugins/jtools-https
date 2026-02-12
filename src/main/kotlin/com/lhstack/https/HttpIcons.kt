@@ -20,4 +20,8 @@ object HttpIcons {
     val remove: Icon = IconLoader.getIcon("/icons/action_remove.svg", HttpIcons::class.java)
     val clear: Icon = IconLoader.getIcon("/icons/action_clear.svg", HttpIcons::class.java)
     val file: Icon = IconLoader.getIcon("/icons/action_file.svg", HttpIcons::class.java)
+    val scriptEnv: Icon = IconLoader.getIcon("/icons/action_script_env.svg", HttpIcons::class.java)
+    val scriptHelp: Icon = IconLoader.getIcon("/icons/action_script_help.svg", HttpIcons::class.java)
+    val scriptTemplate: Icon = IconLoader.getIcon("/icons/action_script_template.svg", HttpIcons::class.java)
+    val scriptSnippet: Icon = IconLoader.getIcon("/icons/action_script_snippet.svg", HttpIcons::class.java)
 }
