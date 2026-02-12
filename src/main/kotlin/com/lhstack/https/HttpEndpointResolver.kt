@@ -27,8 +27,8 @@ object HttpEndpointResolver {
         "OPTIONS"
     )
 
-    fun findEndpoint(element: PsiElement): EndpointInfo? {
-        if(element is PsiMethod) {
+    fun findEndpoint(element: PsiElement,isMethod: Boolean): EndpointInfo? {
+        if(element is PsiMethod && isMethod) {
             val method = element.toUElementOfExpectedTypes(UMethod::class.java) ?: return null
             return fromMethod(method, element,false)
         }
@@ -46,10 +46,6 @@ object HttpEndpointResolver {
         return null
     }
 
-    fun findEndpointInMethod(element: PsiElement): EndpointInfo? {
-        val uMethod = element.getUastParentOfType(UMethod::class.java, false) ?: return null
-        return fromMethod(uMethod, element, false)
-    }
 
     private fun fromMethod(
         uMethod: UMethod,

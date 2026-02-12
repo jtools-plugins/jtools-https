@@ -53,7 +53,7 @@ class HttpAddToCallListAction : AnAction(
         if (psiFile is PsiJavaFile) {
             val element = psiFile.findElementAt(editor.caretModel.offset)
             val psiMethod = PsiTreeUtil.getContextOfType(element, PsiMethod::class.java) ?: return null
-            return HttpEndpointResolver.findEndpoint(psiMethod)?.let { return it }
+            return HttpEndpointResolver.findEndpoint(psiMethod,true)?.let { return it }
         }
         if (psiFile is KtFile) {
             val element = psiFile.findElementAt(editor.caretModel.offset)
@@ -66,7 +66,7 @@ class HttpAddToCallListAction : AnAction(
             val psiMethod = psiClass.allMethods.firstOrNull { m ->
                 ktFunction.textRange?.intersects(m.textRange!!) == true
             } ?: return null
-            return HttpEndpointResolver.findEndpoint(psiMethod)?.let { return it }
+            return HttpEndpointResolver.findEndpoint(psiMethod,true)?.let { return it }
         }
         return null
     }

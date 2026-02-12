@@ -40,7 +40,7 @@ object HttpEndpointLocator {
             }
         }
 
-        var endpoints = methods.mapNotNull { HttpEndpointResolver.findEndpoint(it) }
+        var endpoints = methods.mapNotNull { HttpEndpointResolver.findEndpoint(it,true) }
         if (endpoints.isEmpty()) {
             endpoints = scanAllEndpoints(project, scope)
         }
@@ -84,7 +84,7 @@ object HttpEndpointLocator {
         val results = mutableListOf<EndpointInfo>()
         AllClassesSearch.search(scope, project).forEach { psiClass ->
             psiClass.methods.forEach { method ->
-                val endpoint = HttpEndpointResolver.findEndpoint(method) ?: return@forEach
+                val endpoint = HttpEndpointResolver.findEndpoint(method,true) ?: return@forEach
                 results.add(endpoint)
             }
         }

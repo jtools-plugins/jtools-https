@@ -19,7 +19,7 @@ class HttpEndpointLineMarkerProvider : LineMarkerProviderDescriptor() {
         if (!HttpUiSettingsStore.isLineMarkerEnabled(element.project)) {
             return null
         }
-        val endpoint = HttpEndpointResolver.findEndpoint(element) ?: return null
+        val endpoint = HttpEndpointResolver.findEndpoint(element,false) ?: return null
         val tooltip = endpoint.displayName
         val handler = GutterIconNavigationHandler<PsiElement> { _, elt ->
             val project = elt.project
