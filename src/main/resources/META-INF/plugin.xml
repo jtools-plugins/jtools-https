@@ -1,0 +1,51 @@
+<idea-plugin require-restart="true">
+    <id>com.lhstack.https</id>
+    <name>HTTP Client</name>
+    <version>0.0.1</version>
+    <vendor>lhstack</vendor>
+
+    <description>
+        Lightweight HTTP client with endpoint discovery and request history.
+    </description>
+
+    <change-notes><![CDATA[
+    <p><b>v0.0.1</b></p>
+    <ul>
+        <li>中文：首次发布，提供接口扫描、请求历史与响应渲染等基础功能。</li>
+        <li>English: Initial release with endpoint discovery, request history, and response rendering.</li>
+    </ul>
+    ]]></change-notes>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.java</depends>
+    <depends>org.jetbrains.kotlin</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+            id="HTTP Client"
+            anchor="right"
+            factoryClass="com.lhstack.https.HttpToolWindowFactory"
+            icon="/icons/http_client_tab.svg"/>
+
+        <codeInsight.lineMarkerProvider
+            language="JAVA"
+            implementationClass="com.lhstack.https.HttpEndpointLineMarkerProvider"/>
+        <codeInsight.lineMarkerProvider
+            language="kotlin"
+            implementationClass="com.lhstack.https.HttpEndpointLineMarkerProvider"/>
+    </extensions>
+
+    <extensions defaultExtensionNs="org.jetbrains.kotlin">
+        <supportsKotlinPluginMode supportsK1="true" supportsK2="true"/>
+    </extensions>
+
+    <actions>
+        <action
+            id="jtools.https.addToCallList"
+            class="com.lhstack.https.HttpAddToCallListAction"
+            text="添加到调用列表"
+            description="添加到 HTTP 调用列表">
+            <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+        </action>
+    </actions>
+</idea-plugin>
