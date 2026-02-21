@@ -15,6 +15,7 @@
 - 响应渲染（原始/JSON/XML/HTML/图片）
 - 一键复制 cURL
 - 自动识别本地服务端口并生成请求地址
+- Search Everywhere 集成：`JTools Http Search`（按接口地址/方法名/注释/参数/方法体代码模糊匹配）
 
 ## 使用手册
 
@@ -48,6 +49,7 @@
 
 - **复制 cURL**：点击 **复制 cURL**。
 - **端口识别**：运行本地服务后自动识别端口并填充 URL，未识别时默认 8080。
+- **快速打开接口搜索**：按 `Ctrl + Shift + S` 直接打开 `JTools Http Search`。
 
 ## 构建
 
@@ -79,6 +81,9 @@ build/libs/jtools-https.jar
 - OpenAPI/Swagger 导入增强：支持 URL/文件/JSON 导入，自动识别分组并补充请求示例、请求字段说明、响应字段说明。
 - 文档字段树增强：支持多层对象与多层数组展开，数组嵌套路径保持层级（`[].items[]`），并兼容 `additionalProperties`（如 `channelMapping`）映射结构。
 - 导出能力增强：支持将接口导出为 OpenAPI/Swagger/HTML/PDF，导出时可选择保存路径并保留文档说明信息。
+- 新增 `JTools Http Search`：支持在 Search Everywhere 内按接口地址、方法名、注释、参数、方法体代码进行模糊匹配。
+- 新增源码悬停预览：在搜索结果项悬停可弹出 Java 高亮源码预览（可滚动、可调整大小）。
+- 新增快捷键：`Ctrl + Shift + S` 可快速唤起 `JTools Http Search`。
 
 #### 脚本调用项目依赖示例（v0.0.3）
 

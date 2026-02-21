@@ -6,6 +6,11 @@ import com.intellij.psi.PsiMethod
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.searches.AllClassesSearch
 import com.intellij.psi.search.searches.AnnotatedElementsSearch
+import com.intellij.psi.search.FilenameIndex
+import com.intellij.psi.PsiManager
+import com.intellij.psi.util.PsiTreeUtil
+import org.jetbrains.kotlin.asJava.toLightMethods
+import org.jetbrains.kotlin.psi.KtNamedFunction
 
 object HttpEndpointLocator {
     private val cache = java.util.concurrent.ConcurrentHashMap<Project, MutableList<EndpointInfo>>()
@@ -62,6 +67,33 @@ object HttpEndpointLocator {
         cache.remove(project)
     }
 
+    fun listAll(project: Project): List<EndpointInfo> {
+        val cached = cache[project]?.filter { it.anchor.isValid }
+        if (!cached.isNullOrEmpty()) {
+            if (cached.size != cache[project]?.size) {
+                cache[project] = cached.toMutableList()
+            }
+            return cached
+        }
+        val scope = GlobalSearchScope.projectScope(project)
+        val psiFacade = JavaPsiFacade.getInstance(project)
+        val methods = LinkedHashSet<PsiMethod>()
+        for (annotationName in mappingAnnotations) {
+            val annotationClass = psiFacade.findClass(annotationName, scope) ?: continue
+            AnnotatedElementsSearch.searchElements(annotationClass, scope, PsiMethod::class.java).forEach { method ->
+                methods.add(method)
+            }
+        }
+        var endpoints = methods.mapNotNull { HttpEndpointResolver.findEndpoint(it, true) }
+        if (endpoints.isEmpty()) {
+            endpoints = scanAllEndpoints(project, scope)
+        }
+        if (endpoints.isNotEmpty()) {
+            cache[project] = endpoints.toMutableList()
+        }
+        return endpoints
+    }
+
     private fun findInCache(project: Project, httpMethod: String, requestPath: String): List<EndpointInfo> {
         val cached = cache[project] ?: return emptyList()
         val validEndpoints = cached.filter { it.anchor.isValid }
@@ -86,6 +118,28 @@ object HttpEndpointLocator {
             psiClass.methods.forEach { method ->
                 val endpoint = HttpEndpointResolver.findEndpoint(method,true) ?: return@forEach
                 results.add(endpoint)
+            }
+        }
+        if (results.isNotEmpty()) {
+            return results
+        }
+        results.addAll(scanKotlinEndpoints(project, scope))
+        return results
+    }
+
+    private fun scanKotlinEndpoints(project: Project, scope: GlobalSearchScope): List<EndpointInfo> {
+        val results = mutableListOf<EndpointInfo>()
+        val psiManager = PsiManager.getInstance(project)
+        val kotlinFiles = FilenameIndex.getAllFilesByExt(project, "kt", scope)
+        for (virtualFile in kotlinFiles) {
+            val psiFile = psiManager.findFile(virtualFile) ?: continue
+            val functions = PsiTreeUtil.findChildrenOfType(psiFile, KtNamedFunction::class.java)
+            for (function in functions) {
+                val lightMethods = function.toLightMethods()
+                for (method in lightMethods) {
+                    val endpoint = HttpEndpointResolver.findEndpoint(method, true) ?: continue
+                    results.add(endpoint)
+                }
             }
         }
         return results

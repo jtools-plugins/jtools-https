@@ -21,6 +21,7 @@
         <ul>
             <li>支持从 Spring 注解与 Router Function 识别接口。</li>
             <li>左侧接口列表支持分组、搜索、拖拽排序。</li>
+            <li>支持在 Search Everywhere 使用 <b>JTools Http Search</b> 进行接口/注释/参数/方法体代码模糊搜索。</li>
         </ul>
     ]]></description>
 
@@ -36,6 +37,8 @@
         <li>中文：OpenAPI/Swagger 导入增强，支持 URL/文件/JSON 三种来源，自动分组并补全请求示例、请求字段说明与响应字段说明。</li>
         <li>中文：文档字段树增强，支持多层对象与多层数组展开，保留数组嵌套层级（[].items[]），并支持 additionalProperties 映射对象展开。</li>
         <li>中文：新增接口文档导出能力，支持 OpenAPI/Swagger/HTML/PDF，并在导出时交互选择保存路径。</li>
+        <li>中文：新增 <b>JTools Http Search</b> 搜索贡献者，可按接口地址、方法名、注释、参数与方法体代码进行模糊匹配，并支持源码悬停预览。</li>
+        <li>中文：新增快捷键 <b>Ctrl + Shift + S</b>，可快速唤起 JTools Http Search。</li>
         <li>English: Added pre/post scripting to mutate request and response data around execution.</li>
         <li>English: Added project/global environment variable manager and script-side env/store APIs.</li>
         <li>English: Added script docs, templates, and snippets with improved snippet picker and colored action icons.</li>
@@ -45,6 +48,8 @@
         <li>English: Enhanced OpenAPI/Swagger import with URL/file/JSON sources, auto grouping, and richer request/response doc extraction.</li>
         <li>English: Improved doc field tree to expand deep objects and nested arrays (with [].items[] hierarchy), including additionalProperties map structures.</li>
         <li>English: Added API document export to OpenAPI/Swagger/HTML/PDF with interactive save-path selection.</li>
+        <li>English: Added <b>JTools Http Search</b> contributor for fuzzy matching across endpoint URL, method name, comments, params, and method body source.</li>
+        <li>English: Added shortcut <b>Ctrl + Shift + S</b> to open JTools Http Search quickly.</li>
     </ul>
     <p><b>v0.0.1</b></p>
     <ul>
@@ -63,6 +68,9 @@
             anchor="right"
             factoryClass="com.lhstack.https.HttpToolWindowFactory"
             icon="/icons/http_client_tab.svg"/>
+
+        <searchEverywhereContributor
+            implementation="com.lhstack.https.JToolsHttpSearchContributorFactory"/>
 
         <projectConfigurable
             id="com.lhstack.https.settings"
@@ -89,6 +97,14 @@
             text="添加到调用列表"
             description="添加到 HTTP 调用列表">
             <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+        </action>
+
+        <action
+            id="jtools.https.openHttpSearch"
+            class="com.lhstack.https.OpenJToolsHttpSearchAction"
+            text="JTools Http Search"
+            description="打开 JTools Http Search 搜索面板">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift S"/>
         </action>
     </actions>
 </idea-plugin>
