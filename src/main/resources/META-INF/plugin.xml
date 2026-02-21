@@ -1,6 +1,6 @@
 <idea-plugin require-restart="true">
     <id>com.lhstack.https</id>
-    <name>HTTP Client</name>
+    <name>JTools HTTP Client</name>
     <version>0.0.3</version>
     <vendor>lhstack</vendor>
 
