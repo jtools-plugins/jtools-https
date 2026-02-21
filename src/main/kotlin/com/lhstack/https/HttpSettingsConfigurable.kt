@@ -108,7 +108,7 @@ class HttpSettingsConfigurable(private val project: Project) : SearchableConfigu
             throw ConfigurationException("渲染预览上限范围 0(不限) 或 $MIN_PREVIEW_CHARS-$MAX_PREVIEW_CHARS")
         }
 
-        val updated = HttpUiSettings(
+        val updated = cachedSettings.copy(
             defaultTimeoutSeconds = timeout,
             maxRawViewChars = rawLimit,
             maxRenderChars = renderLimit,

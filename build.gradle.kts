@@ -27,6 +27,8 @@ dependencies {
         exclude(group = "org.slf4j", module = "slf4j-api")
     }
     implementation("org.openjdk.nashorn:nashorn-core:15.6")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.17.2")
+    implementation("org.apache.pdfbox:pdfbox:2.0.31")
     intellijPlatform{
         intellijIdeaCommunity("2022.3")
         bundledPlugin("com.intellij.java")

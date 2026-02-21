@@ -61,17 +61,21 @@ build/libs/jtools-https.jar
 
 ## 版本
 
-- 当前版本：0.0.2
+- 当前版本：0.0.3
 
-### v0.0.2
+### v0.0.3
 
 - 新增前置脚本与后置脚本，可在请求发送前后动态处理 URL、参数、请求头、Cookie 和响应内容。
 - 新增脚本环境变量管理（项目级/全局级），支持在脚本中通过 `env` / `store` 读取与写入。
 - 新增脚本使用辅助能力：API 说明、示例脚本、片段插入，支持彩色图标入口和片段选择。
 - 新增 `jvm` bridge，可通过 `jvm.type("全限定类名")` 调用项目依赖库静态方法（例如 AES 工具类）。
 - 脚本引擎增强：支持 ES6 模板字符串（反引号插值），并兼容 `log.info` / `log.warn` / `log.error` 写法。
+- 新增接口文档能力：支持请求文档/响应文档编辑，响应状态码（code + 说明）可编辑并参与导入导出。
+- OpenAPI/Swagger 导入增强：支持 URL/文件/JSON 导入，自动识别分组并补充请求示例、请求字段说明、响应字段说明。
+- 文档字段树增强：支持多层对象与多层数组展开，数组嵌套路径保持层级（`[].items[]`），并兼容 `additionalProperties`（如 `channelMapping`）映射结构。
+- 导出能力增强：支持将接口导出为 OpenAPI/Swagger/HTML/PDF，导出时可选择保存路径并保留文档说明信息。
 
-#### 脚本调用项目依赖示例（v0.0.2）
+#### 脚本调用项目依赖示例（v0.0.3）
 
 ```javascript
 var AES = jvm.type("com.company.common.crypto.AES");

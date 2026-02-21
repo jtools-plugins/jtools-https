@@ -1,7 +1,7 @@
 <idea-plugin require-restart="true">
     <id>com.lhstack.https</id>
     <name>HTTP Client</name>
-    <version>0.0.2</version>
+    <version>0.0.3</version>
     <vendor>lhstack</vendor>
 
     <description><![CDATA[
@@ -25,18 +25,26 @@
     ]]></description>
 
     <change-notes><![CDATA[
-    <p><b>v0.0.2</b></p>
+    <p><b>v0.0.3</b></p>
     <ul>
         <li>中文：新增前置/后置脚本能力，可在发送前后动态处理 URL、参数、Header、Cookie 与响应数据。</li>
         <li>中文：新增脚本环境变量管理（项目级/全局级），并支持脚本内通过 env/store 读取与写入。</li>
         <li>中文：新增脚本说明、示例与片段插入，支持脚本片段选择与彩色图标入口，降低脚本编写门槛。</li>
         <li>中文：新增 jvm bridge，可通过 jvm.type("全限定类名") 直接调用项目依赖库的静态方法。</li>
         <li>中文：脚本引擎增强，支持 ES6 模板字符串（反引号插值）与 log.info/log.warn/log.error 方式记录日志。</li>
+        <li>中文：新增接口文档编辑能力，支持请求文档/响应文档维护，响应状态码（code + 描述）可编辑并参与导入导出。</li>
+        <li>中文：OpenAPI/Swagger 导入增强，支持 URL/文件/JSON 三种来源，自动分组并补全请求示例、请求字段说明与响应字段说明。</li>
+        <li>中文：文档字段树增强，支持多层对象与多层数组展开，保留数组嵌套层级（[].items[]），并支持 additionalProperties 映射对象展开。</li>
+        <li>中文：新增接口文档导出能力，支持 OpenAPI/Swagger/HTML/PDF，并在导出时交互选择保存路径。</li>
         <li>English: Added pre/post scripting to mutate request and response data around execution.</li>
         <li>English: Added project/global environment variable manager and script-side env/store APIs.</li>
         <li>English: Added script docs, templates, and snippets with improved snippet picker and colored action icons.</li>
         <li>English: Added JVM bridge via jvm.type("FQCN") so scripts can call static methods from project dependencies.</li>
         <li>English: Script runtime now supports ES6 template literals and log.info/log.warn/log.error aliases.</li>
+        <li>English: Added API documentation editing for request/response docs; response status codes (code + description) are editable and preserved in import/export.</li>
+        <li>English: Enhanced OpenAPI/Swagger import with URL/file/JSON sources, auto grouping, and richer request/response doc extraction.</li>
+        <li>English: Improved doc field tree to expand deep objects and nested arrays (with [].items[] hierarchy), including additionalProperties map structures.</li>
+        <li>English: Added API document export to OpenAPI/Swagger/HTML/PDF with interactive save-path selection.</li>
     </ul>
     <p><b>v0.0.1</b></p>
     <ul>

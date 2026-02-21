@@ -53,6 +53,12 @@ object HttpSqliteDb {
                             max_render_chars INTEGER NOT NULL,
                             line_marker_enabled INTEGER NOT NULL DEFAULT 1,
                             context_menu_enabled INTEGER NOT NULL DEFAULT 1,
+                            proxy_enabled INTEGER NOT NULL DEFAULT 0,
+                            proxy_type TEXT NOT NULL DEFAULT 'HTTP',
+                            proxy_host TEXT NOT NULL DEFAULT '',
+                            proxy_port INTEGER NOT NULL DEFAULT 0,
+                            proxy_username TEXT NOT NULL DEFAULT '',
+                            proxy_password TEXT NOT NULL DEFAULT '',
                             created_at TEXT NOT NULL,
                             updated_at TEXT NOT NULL
                         )
@@ -144,6 +150,24 @@ object HttpSqliteDb {
                     }
                     runCatching {
                         stmt.execute("ALTER TABLE ui_settings ADD COLUMN context_menu_enabled INTEGER NOT NULL DEFAULT 1")
+                    }
+                    runCatching {
+                        stmt.execute("ALTER TABLE ui_settings ADD COLUMN proxy_enabled INTEGER NOT NULL DEFAULT 0")
+                    }
+                    runCatching {
+                        stmt.execute("ALTER TABLE ui_settings ADD COLUMN proxy_type TEXT NOT NULL DEFAULT 'HTTP'")
+                    }
+                    runCatching {
+                        stmt.execute("ALTER TABLE ui_settings ADD COLUMN proxy_host TEXT NOT NULL DEFAULT ''")
+                    }
+                    runCatching {
+                        stmt.execute("ALTER TABLE ui_settings ADD COLUMN proxy_port INTEGER NOT NULL DEFAULT 0")
+                    }
+                    runCatching {
+                        stmt.execute("ALTER TABLE ui_settings ADD COLUMN proxy_username TEXT NOT NULL DEFAULT ''")
+                    }
+                    runCatching {
+                        stmt.execute("ALTER TABLE ui_settings ADD COLUMN proxy_password TEXT NOT NULL DEFAULT ''")
                     }
                 }
             }

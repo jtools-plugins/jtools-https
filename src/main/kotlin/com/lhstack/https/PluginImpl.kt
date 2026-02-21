@@ -41,7 +41,7 @@ class PluginImpl : IPlugin {
     }
 
     override fun pluginVersion(): String {
-        return "v1"
+        return "v0.0.3"
     }
 
     override fun openProject(project: Project?, logger: Logger?, openThisPage: Runnable?) {
@@ -92,8 +92,11 @@ class PluginImpl : IPlugin {
         return false
     }
 
-    override fun functionCallings(project: Project?): List<FunctionCalling?>? {
-        return emptyList()
+    override fun functionCallings(project: Project?): List<FunctionCalling> {
+        if (project == null) {
+            return emptyList()
+        }
+        return HttpsFunctionCallingRegistry(project).functionCallings()
     }
 
     override fun tabPanelActions(project: Project?, pluginPanel: JComponent?): List<AnAction?>? {

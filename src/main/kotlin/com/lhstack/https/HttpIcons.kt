@@ -13,6 +13,8 @@ object HttpIcons {
     val save: Icon = IconLoader.getIcon("/icons/action_save.svg", HttpIcons::class.java)
     val history: Icon = IconLoader.getIcon("/icons/action_history.svg", HttpIcons::class.java)
     val historyRequest: Icon = IconLoader.getIcon("/icons/action_history_request.svg", HttpIcons::class.java)
+    val importApi: Icon = IconLoader.getIcon("/icons/action_import.svg", HttpIcons::class.java)
+    val exportApi: Icon = IconLoader.getIcon("/icons/action_export.svg", HttpIcons::class.java)
     val groupAdd: Icon = IconLoader.getIcon("/icons/action_group_add.svg", HttpIcons::class.java)
     val tabAdd: Icon = IconLoader.getIcon("/icons/action_tab_add.svg", HttpIcons::class.java)
     val download: Icon = IconLoader.getIcon("/icons/action_download.svg", HttpIcons::class.java)

@@ -27,7 +27,8 @@ data class EndpointInfo(
 @Tag("kv")
 data class HttpKeyValue(
     @Attribute var key: String = "",
-    @Attribute var value: String = ""
+    @Attribute var value: String = "",
+    @Attribute var description: String = ""
 )
 
 enum class HttpBodyType {
@@ -66,9 +67,19 @@ data class HttpRequestDraft(
     var urlEncoded: MutableList<HttpKeyValue> = mutableListOf(),
     @XCollection(style = XCollection.Style.v2, elementName = "form")
     var formFields: MutableList<HttpFormField> = mutableListOf(),
+    @XCollection(style = XCollection.Style.v2, elementName = "request-body-param")
+    var requestBodyParams: MutableList<HttpKeyValue> = mutableListOf(),
     var body: String? = null,
     var preScript: String? = null,
-    var postScript: String? = null
+    var postScript: String? = null,
+    @Attribute var responseStatus: String = "",
+    @Attribute var responseContentType: String = "",
+    var responseDescription: String? = null,
+    var responseBody: String? = null,
+    @XCollection(style = XCollection.Style.v2, elementName = "response-status-doc")
+    var responseStatusDocs: MutableList<HttpKeyValue> = mutableListOf(),
+    @XCollection(style = XCollection.Style.v2, elementName = "response-param")
+    var responseParams: MutableList<HttpKeyValue> = mutableListOf()
 )
 
 @Tag("cookie")

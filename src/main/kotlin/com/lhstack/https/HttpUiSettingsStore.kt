@@ -10,7 +10,13 @@ data class HttpUiSettings(
     @Attribute var maxRawViewChars: Int = 0,
     @Attribute var maxRenderChars: Int = 0,
     @Attribute var lineMarkerEnabled: Boolean = true,
-    @Attribute var contextMenuEnabled: Boolean = true
+    @Attribute var contextMenuEnabled: Boolean = true,
+    @Attribute var proxyEnabled: Boolean = false,
+    @Attribute var proxyType: String = "HTTP",
+    @Attribute var proxyHost: String = "",
+    @Attribute var proxyPort: Int = 0,
+    @Attribute var proxyUsername: String = "",
+    @Attribute var proxyPassword: String = ""
 )
 
 object HttpUiSettingsStore {
@@ -23,7 +29,18 @@ object HttpUiSettingsStore {
         val settings = HttpSqliteDb.withConnection(project) { connection ->
             connection.prepareStatement(
                 """
-                SELECT default_timeout_seconds, max_raw_view_chars, max_render_chars, line_marker_enabled, context_menu_enabled
+                SELECT
+                    default_timeout_seconds,
+                    max_raw_view_chars,
+                    max_render_chars,
+                    line_marker_enabled,
+                    context_menu_enabled,
+                    proxy_enabled,
+                    proxy_type,
+                    proxy_host,
+                    proxy_port,
+                    proxy_username,
+                    proxy_password
                 FROM ui_settings
                 ORDER BY id
                 LIMIT 1
@@ -38,7 +55,13 @@ object HttpUiSettingsStore {
                         maxRawViewChars = rs.getInt("max_raw_view_chars"),
                         maxRenderChars = rs.getInt("max_render_chars"),
                         lineMarkerEnabled = rs.getInt("line_marker_enabled") != 0,
-                        contextMenuEnabled = rs.getInt("context_menu_enabled") != 0
+                        contextMenuEnabled = rs.getInt("context_menu_enabled") != 0,
+                        proxyEnabled = rs.getInt("proxy_enabled") != 0,
+                        proxyType = rs.getString("proxy_type") ?: "HTTP",
+                        proxyHost = rs.getString("proxy_host") ?: "",
+                        proxyPort = rs.getInt("proxy_port"),
+                        proxyUsername = rs.getString("proxy_username") ?: "",
+                        proxyPassword = rs.getString("proxy_password") ?: ""
                     )
                 }
             }
@@ -61,15 +84,27 @@ object HttpUiSettingsStore {
                     max_render_chars,
                     line_marker_enabled,
                     context_menu_enabled,
+                    proxy_enabled,
+                    proxy_type,
+                    proxy_host,
+                    proxy_port,
+                    proxy_username,
+                    proxy_password,
                     created_at,
                     updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     default_timeout_seconds = excluded.default_timeout_seconds,
                     max_raw_view_chars = excluded.max_raw_view_chars,
                     max_render_chars = excluded.max_render_chars,
                     line_marker_enabled = excluded.line_marker_enabled,
                     context_menu_enabled = excluded.context_menu_enabled,
+                    proxy_enabled = excluded.proxy_enabled,
+                    proxy_type = excluded.proxy_type,
+                    proxy_host = excluded.proxy_host,
+                    proxy_port = excluded.proxy_port,
+                    proxy_username = excluded.proxy_username,
+                    proxy_password = excluded.proxy_password,
                     updated_at = excluded.updated_at
                 """.trimIndent()
             ).use { stmt ->
@@ -78,8 +113,14 @@ object HttpUiSettingsStore {
                 stmt.setInt(3, sanitized.maxRenderChars)
                 stmt.setInt(4, if (sanitized.lineMarkerEnabled) 1 else 0)
                 stmt.setInt(5, if (sanitized.contextMenuEnabled) 1 else 0)
-                stmt.setString(6, now)
-                stmt.setString(7, now)
+                stmt.setInt(6, if (sanitized.proxyEnabled) 1 else 0)
+                stmt.setString(7, sanitized.proxyType)
+                stmt.setString(8, sanitized.proxyHost)
+                stmt.setInt(9, sanitized.proxyPort)
+                stmt.setString(10, sanitized.proxyUsername)
+                stmt.setString(11, sanitized.proxyPassword)
+                stmt.setString(12, now)
+                stmt.setString(13, now)
                 stmt.executeUpdate()
             }
         }
@@ -104,10 +145,19 @@ object HttpUiSettingsStore {
         else settings.maxRawViewChars.coerceIn(MIN_PREVIEW_CHARS, MAX_PREVIEW_CHARS)
         val render = if (settings.maxRenderChars == 0) 0
         else settings.maxRenderChars.coerceIn(MIN_PREVIEW_CHARS, MAX_PREVIEW_CHARS)
+        val proxyType = settings.proxyType.trim().uppercase().ifBlank { "HTTP" }
+            .takeIf { it == "HTTP" || it == "SOCKS" } ?: "HTTP"
+        val proxyHost = settings.proxyHost.trim()
+        val proxyPort = if (settings.proxyPort in 1..65535) settings.proxyPort else 0
+        val proxyUsername = settings.proxyUsername.trim()
         return settings.copy(
             defaultTimeoutSeconds = timeout,
             maxRawViewChars = raw,
-            maxRenderChars = render
+            maxRenderChars = render,
+            proxyType = proxyType,
+            proxyHost = proxyHost,
+            proxyPort = proxyPort,
+            proxyUsername = proxyUsername
         )
     }
 }

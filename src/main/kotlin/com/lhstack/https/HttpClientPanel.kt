@@ -1,5 +1,7 @@
 package com.lhstack.https
 
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.JsonNode
 import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer
 import com.intellij.icons.AllIcons
 import com.intellij.ide.highlighter.XmlFileType
@@ -52,8 +54,15 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.InputStream
+import java.net.Authenticator
 import java.net.HttpCookie
+import java.net.InetSocketAddress
+import java.net.PasswordAuthentication
+import java.net.Proxy
+import java.net.ProxySelector
+import java.net.SocketAddress
 import java.net.URI
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -143,15 +152,24 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val historyAction = simpleAction("历史请求", "查看历史请求", HttpIcons.history) {
         showHistoryDialog()
     }
+    private val importApiAction = simpleAction("导入", "导入 OpenAPI/Swagger 接口", HttpIcons.importApi) {
+        showImportApiDialog()
+    }
+    private val exportApiAction = simpleAction("导出", "导出选中接口", HttpIcons.exportApi) {
+        showExportApiDialog()
+    }
     private val requestHistoryAction = simpleAction("历史", "查看当前请求历史", HttpIcons.historyRequest) {
         showCurrentRequestHistory()
     }
 
-    private val pathParamsModel = DefaultTableModel(arrayOf("键", "值"), 0)
-    private val paramsModel = DefaultTableModel(arrayOf("键", "值"), 0)
-    private val headersModel = DefaultTableModel(arrayOf("键", "值"), 0)
-    private val urlEncodedModel = DefaultTableModel(arrayOf("键", "值"), 0)
+    private val pathParamsModel = DefaultTableModel(arrayOf("键", "值", "说明"), 0)
+    private val paramsModel = DefaultTableModel(arrayOf("键", "值", "说明"), 0)
+    private val headersModel = DefaultTableModel(arrayOf("键", "值", "说明"), 0)
+    private val urlEncodedModel = DefaultTableModel(arrayOf("键", "值", "说明"), 0)
     private val formDataModel = DefaultTableModel(arrayOf("键", "值", "类型"), 0)
+    private val requestDocParamsModel = DefaultTableModel(arrayOf("字段", "示例", "说明"), 0)
+    private val responseStatusDocsModel = DefaultTableModel(arrayOf("状态码", "说明"), 0)
+    private val responseDocParamsModel = DefaultTableModel(arrayOf("字段", "示例", "说明"), 0)
     private val cookiesModel = DefaultTableModel(arrayOf("名称", "值", "域", "路径", "过期时间", "安全", "HttpOnly"), 0)
     private val cookieEntries = mutableListOf<HttpCookieEntry>()
     private lateinit var cookiesTable: JBTable
@@ -163,6 +181,12 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val scriptFileType = resolveScriptFileType()
     private val preScriptArea = MultiLanguageTextField(scriptFileType, project)
     private val postScriptArea = MultiLanguageTextField(scriptFileType, project)
+    private val requestDocBodyEditor = MultiLanguageTextField(JsonFileType.INSTANCE, project)
+    private val requestDocExampleModeLabel = JBLabel("请求体类型: 无")
+    private val responseDocBodyEditor = MultiLanguageTextField(JsonFileType.INSTANCE, project)
+    private val responseDocStatusField = JBTextField()
+    private val responseDocContentTypeField = JBTextField("application/json")
+    private val responseDocDescriptionField = JBTextField()
 
     private val responseSummary = JBLabel("暂无响应")
     private val responseRawArea = createViewerField()
@@ -194,6 +218,10 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private var responseActionsToolbar: ActionToolbar? = null
     private var responseDownloadEnabled = false
     private lateinit var responseTabs: JBTabbedPane
+    private lateinit var requestResponseSplit: JBSplitter
+    private lateinit var responseCollapseButton: JButton
+    private var responsePanelCollapsed = false
+    private var responseExpandedProportion = 0.55f
 
     private var currentTab: HttpCallTab? = null
     private val tabResponses = mutableMapOf<Long, HttpResponseSnapshot?>()
@@ -213,13 +241,48 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private var renderInFlightVersion = -1
     private var nextTempTabId = -1L
     private val pendingTabInserts = mutableSetOf<Long>()
+    private val jsonMapper = ObjectMapper()
+    private var syncingDocEditors = false
 
     init {
         border = JBUI.Borders.empty(8)
         buildHistoryPanel()
+        setupDocPreviewListeners()
         loadApiData()
         loadCallTabs()
         loadCookies()
+    }
+
+    private fun setupDocPreviewListeners() {
+        val refresh = {
+            if (!isLoading) {
+                refreshRequestDocExampleFromUi()
+            }
+        }
+        listOf(pathParamsModel, paramsModel, headersModel, urlEncodedModel, formDataModel, requestDocParamsModel)
+            .forEach { model ->
+                model.addTableModelListener { refresh() }
+            }
+        bodyArea.document.addDocumentListener(object : com.intellij.openapi.editor.event.DocumentListener {
+            override fun documentChanged(event: com.intellij.openapi.editor.event.DocumentEvent) {
+                refresh()
+            }
+        })
+        requestDocBodyEditor.document.addDocumentListener(object : com.intellij.openapi.editor.event.DocumentListener {
+            override fun documentChanged(event: com.intellij.openapi.editor.event.DocumentEvent) {
+                if (!isLoading) {
+                    syncRequestBodyFromDocEditor()
+                }
+            }
+        })
+        responseDocBodyEditor.document.addDocumentListener(object : com.intellij.openapi.editor.event.DocumentListener {
+            override fun documentChanged(event: com.intellij.openapi.editor.event.DocumentEvent) {
+                if (!isLoading) {
+                    syncResponseDocParamsFromBody()
+                }
+            }
+        })
+        bodyTypeBox.addActionListener { refresh() }
     }
 
     fun disposePanel() {
@@ -245,11 +308,20 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             headersModel.setRowCount(0)
             urlEncodedModel.setRowCount(0)
             formDataModel.setRowCount(0)
+            requestDocParamsModel.setRowCount(0)
+            responseStatusDocsModel.setRowCount(0)
+            responseDocParamsModel.setRowCount(0)
             cookiesModel.setRowCount(0)
             cookieEntries.clear()
             bodyArea.text = ""
             preScriptArea.text = ""
             postScriptArea.text = ""
+            requestDocBodyEditor.text = ""
+            requestDocExampleModeLabel.text = "请求体类型: 无"
+            responseDocBodyEditor.text = ""
+            responseDocStatusField.text = ""
+            responseDocContentTypeField.text = "application/json"
+            responseDocDescriptionField.text = ""
             responseRawArea.text = ""
             responseRenderArea.text = ""
             responseRenderJsonArea.text = ""
@@ -314,7 +386,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         apiTree.showsRootHandles = true
         apiTree.rowHeight = JBUI.scale(24)
         apiTree.putClientProperty("JTree.lineStyle", "None")
-        apiTree.selectionModel.selectionMode = javax.swing.tree.TreeSelectionModel.SINGLE_TREE_SELECTION
+        apiTree.selectionModel.selectionMode = javax.swing.tree.TreeSelectionModel.DISCONTIGUOUS_TREE_SELECTION
         apiTree.cellRenderer = ApiTreeRenderer()
         apiTree.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
@@ -358,11 +430,12 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             createGroup(null)
         }
 
-        val apiHeader = JPanel(BorderLayout(6, 0))
+        val apiHeader = JPanel(BorderLayout(10, 0))
+        apiHeader.border = JBUI.Borders.empty(0, 2)
         apiHeader.add(JBLabel("接口列表"), BorderLayout.WEST)
         val apiActionsToolbar = buildActionToolbar(
             "HttpApiActionsToolbar",
-            listOf(historyAction, newGroupAction),
+            listOf(historyAction, importApiAction, exportApiAction, newGroupAction),
             apiHeader
         )
         apiHeader.add(apiActionsToolbar.component, BorderLayout.EAST)
@@ -468,6 +541,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         val paramsPanel = createKeyValuePanel(paramsModel, "查询参数")
         val headersPanel = createKeyValuePanel(headersModel, "请求头")
         val bodyPanel = buildBodyPanel()
+        val apiDocPanel = buildApiDocPanel()
         val cookiesPanel = createCookiePanel()
 
         val requestTabs = JBTabbedPane()
@@ -478,6 +552,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         requestTabs.addTab("Cookie", cookiesPanel)
         requestTabs.addTab("前置脚本", createScriptPanel(preScriptArea, ScriptPhase.PRE))
         requestTabs.addTab("后置脚本", createScriptPanel(postScriptArea, ScriptPhase.POST))
+        requestTabs.addTab("接口文档", apiDocPanel)
 
         responseRenderHtml.isEditable = false
 
@@ -508,11 +583,25 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             renderTabIfNeeded(responseTabs.selectedIndex)
         }
 
+        responseCollapseButton = JButton("收起响应").apply {
+            isFocusable = false
+            margin = JBUI.insets(2, 8)
+            toolTipText = "收起响应区域"
+            addActionListener { toggleResponsePanelCollapsed() }
+        }
+        val responseHeaderActions = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+            isOpaque = false
+            add(responseCollapseButton)
+        }
+        val responseHeader = JPanel(BorderLayout(6, 0))
+        responseHeader.add(responseSummary, BorderLayout.CENTER)
+        responseHeader.add(responseHeaderActions, BorderLayout.EAST)
+
         val responsePanel = JPanel(BorderLayout(0, 6))
-        responsePanel.add(responseSummary, BorderLayout.NORTH)
+        responsePanel.add(responseHeader, BorderLayout.NORTH)
         responsePanel.add(responseTabs, BorderLayout.CENTER)
 
-        val requestResponseSplit = JBSplitter(true, 0.55f)
+        requestResponseSplit = JBSplitter(true, responseExpandedProportion)
         requestResponseSplit.firstComponent = requestTabs
         requestResponseSplit.secondComponent = responsePanel
         requestResponseSplit.border = JBUI.Borders.empty()
@@ -520,7 +609,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         requestResponseSplit.setShowDividerControls(true)
         requestResponseSplit.setShowDividerIcon(true)
         requestResponseSplit.setResizeEnabled(true)
-        requestResponseSplit.proportion = 0.55f
+        requestResponseSplit.proportion = responseExpandedProportion
+        applyResponsePanelCollapsed(collapsed = false, rememberCurrent = false)
 
         val headerPanel = JPanel(BorderLayout(0, 6))
         headerPanel.add(tabBar, BorderLayout.NORTH)
@@ -539,6 +629,18 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         apiRequests.clear()
         apiRequests.addAll(HttpApiStorage.loadRequests(project))
         rebuildApiTree()
+    }
+
+    fun reloadApiDataFromStorage() {
+        val selected = currentTab
+        loadApiData()
+        refreshCallTabTitles()
+        if (selected != null) {
+            val index = callTabs.indexOfFirst { it.id == selected.id }
+            if (index >= 0) {
+                selectCallTab(index)
+            }
+        }
     }
 
     private fun loadCallTabs() {
@@ -567,40 +669,97 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun showApiPopup(event: MouseEvent) {
         val path = apiTree.getPathForLocation(event.x, event.y) ?: return
-        apiTree.selectionPath = path
+        val alreadySelected = apiTree.selectionPaths?.any { it.lastPathComponent == path.lastPathComponent } == true
+        if (!alreadySelected) {
+            apiTree.selectionPath = path
+        }
+        val selectedPathCount = apiTree.selectionPaths?.size ?: 0
+        val isMultiSelection = selectedPathCount > 1
         val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
         val userObject = node.userObject
+        val selectedDirectRequests = selectedRequestNodes()
+        val selectedRequestsWithChildren = selectedRequests(includeGroupChildren = true)
+        val selectedGroups = selectedGroupNodes(includeChildren = true)
         val menu = JPopupMenu()
         when (userObject) {
             is HttpApiGroup -> {
-                val addGroup = JMenuItem("新建子分组")
-                addGroup.addActionListener { createGroup(userObject.id) }
-                menu.add(addGroup)
+                if (isMultiSelection) {
+                    appendBatchSelectionActions(menu, selectedGroups, selectedRequestsWithChildren)
+                } else {
+                    val addGroup = JMenuItem("新建子分组")
+                    addGroup.addActionListener { createGroup(userObject.id) }
+                    menu.add(addGroup)
 
-                val rename = JMenuItem("重命名")
-                rename.addActionListener { renameGroup(userObject) }
-                menu.add(rename)
+                    val exportGroup = JMenuItem("导出分组接口")
+                    exportGroup.addActionListener { showExportApiDialog(collectRequestsForGroup(userObject.id)) }
+                    menu.add(exportGroup)
 
-                val delete = JMenuItem("删除")
-                delete.addActionListener { deleteGroup(userObject) }
-                menu.add(delete)
+                    val rename = JMenuItem("重命名")
+                    rename.addActionListener { renameGroup(userObject) }
+                    menu.add(rename)
+
+                    val delete = JMenuItem("删除")
+                    delete.addActionListener { deleteGroup(userObject) }
+                    menu.add(delete)
+                }
             }
             is HttpSavedRequest -> {
-                val open = JMenuItem("打开")
-                open.addActionListener { openRequestInTab(userObject) }
-                menu.add(open)
+                if (isMultiSelection) {
+                    val targets = if (selectedDirectRequests.size > 1) {
+                        selectedDirectRequests
+                    } else {
+                        selectedRequestsWithChildren
+                    }
+                    appendBatchSelectionActions(menu, selectedGroups, targets)
+                } else {
+                    val open = JMenuItem("打开")
+                    open.addActionListener { openRequestInTab(userObject) }
+                    menu.add(open)
 
-                val rename = JMenuItem("重命名")
-                rename.addActionListener { renameRequest(userObject) }
-                menu.add(rename)
+                    val export = JMenuItem("导出")
+                    export.addActionListener { showExportApiDialog(listOf(userObject)) }
+                    menu.add(export)
 
-                val delete = JMenuItem("删除")
-                delete.addActionListener { deleteRequest(userObject) }
-                menu.add(delete)
+                    val rename = JMenuItem("重命名")
+                    rename.addActionListener { renameRequest(userObject) }
+                    menu.add(rename)
+
+                    val delete = JMenuItem("删除")
+                    delete.addActionListener { deleteRequest(userObject) }
+                    menu.add(delete)
+                }
             }
         }
         if (menu.componentCount > 0) {
             menu.show(apiTree, event.x, event.y)
+        }
+    }
+
+    private fun appendBatchSelectionActions(
+        menu: JPopupMenu,
+        groups: List<HttpApiGroup>,
+        requests: List<HttpSavedRequest>
+    ) {
+        val targetGroups = groups.filter { it.id > 0 }.distinctBy { it.id }
+        val targets = requests.filter { it.id > 0 }.distinctBy { it.id }
+        if (targetGroups.isEmpty() && targets.isEmpty()) {
+            return
+        }
+        val exportSelected = JMenuItem("导出选中接口(${targets.size})")
+        exportSelected.isEnabled = targets.isNotEmpty()
+        exportSelected.addActionListener { showExportApiDialog(targets) }
+        menu.add(exportSelected)
+        val deleteLabel = buildBatchDeleteMenuLabel(targetGroups.size, targets.size)
+        val deleteSelected = JMenuItem(deleteLabel)
+        deleteSelected.addActionListener { deleteApiTargets(targetGroups, targets) }
+        menu.add(deleteSelected)
+    }
+
+    private fun buildBatchDeleteMenuLabel(groupCount: Int, requestCount: Int): String {
+        return when {
+            groupCount > 0 && requestCount > 0 -> "批量删除选中分组($groupCount)和接口($requestCount)"
+            groupCount > 0 -> "批量删除选中分组($groupCount)"
+            else -> "批量删除选中接口($requestCount)"
         }
     }
 
@@ -626,6 +785,220 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         apiGroups.add(group)
         rebuildApiTree()
         selectGroupNode(group.id)
+    }
+
+    private fun showImportApiDialog() {
+        val dialog = ImportApiDialog(project)
+        if (!dialog.showAndGet()) {
+            return
+        }
+        when (dialog.sourceType) {
+            HttpApiSpecImportService.SourceType.FILE -> {
+                runImportSpecTask("文件导入") {
+                    HttpApiSpecImportService.importFromFile(
+                        project = project,
+                        filePath = dialog.filePath,
+                        rootGroupName = null,
+                        overwriteExisting = true
+                    )
+                }
+            }
+            HttpApiSpecImportService.SourceType.URL -> {
+                runImportSpecTask("网络地址导入") {
+                    HttpApiSpecImportService.importFromUrl(
+                        project = project,
+                        url = dialog.url,
+                        rootGroupName = null,
+                        overwriteExisting = true
+                    )
+                }
+            }
+            HttpApiSpecImportService.SourceType.JSON -> {
+                runImportSpecTask("JSON 导入") {
+                    HttpApiSpecImportService.importFromJson(
+                        project = project,
+                        json = dialog.json,
+                        options = HttpApiSpecImportService.ImportOptions(
+                            sourceType = HttpApiSpecImportService.SourceType.JSON,
+                            source = "dialog",
+                            rootGroupName = null,
+                            overwriteExisting = true
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private fun runImportSpecTask(title: String, action: () -> HttpApiSpecImportService.ImportResult) {
+        ProgressManager.getInstance().run(object : Task.Backgroundable(project, "导入接口文档", true) {
+            override fun run(indicator: ProgressIndicator) {
+                indicator.text = "正在解析并导入接口..."
+                val result = action()
+                SwingUtilities.invokeLater {
+                    reloadApiDataFromStorage()
+                    val message = buildString {
+                        append("来源: ").append(result.sourceType.name).append("\n")
+                        append("规范: ").append(result.detectedSpecType).append("\n")
+                        append("总接口: ").append(result.totalEndpoints).append("\n")
+                        append("新增分组: ").append(result.createdGroups).append("\n")
+                        append("新增接口: ").append(result.createdRequests).append("\n")
+                        append("更新接口: ").append(result.updatedRequests).append("\n")
+                        append("跳过接口: ").append(result.skippedRequests)
+                    }
+                    Messages.showInfoMessage(project, message, "$title 完成")
+                }
+            }
+
+            override fun onThrowable(error: Throwable) {
+                SwingUtilities.invokeLater {
+                    val message = error.message?.ifBlank { "导入失败" } ?: "导入失败"
+                    Messages.showErrorDialog(project, message, title)
+                }
+            }
+        })
+    }
+
+    private fun showExportApiDialog(explicitRequests: List<HttpSavedRequest>? = null) {
+        val selected = explicitRequests?.filter { it.id > 0 }?.distinctBy { it.id }.orEmpty()
+        val targets = if (selected.isNotEmpty()) {
+            selected
+        } else {
+            val fromSelection = selectedRequests(includeGroupChildren = true)
+            if (fromSelection.isNotEmpty()) {
+                fromSelection
+            } else {
+                val confirm = Messages.showYesNoDialog(
+                    project,
+                    "当前未选择接口，是否导出全部已保存接口？",
+                    "导出接口",
+                    null
+                )
+                if (confirm != Messages.YES) {
+                    return
+                }
+                apiRequests.filter { it.id > 0 }
+            }
+        }
+        if (targets.isEmpty()) {
+            Messages.showInfoMessage(project, "暂无可导出的接口。", "导出接口")
+            return
+        }
+        val dialog = ExportApiDialog(project, targets.size)
+        if (!dialog.showAndGet()) {
+            return
+        }
+        val format = dialog.format
+        val export = HttpApiDocumentExportService.buildExportContent(
+            format = format,
+            requests = targets,
+            title = dialog.titleValue,
+            version = dialog.versionValue,
+            serverUrl = dialog.serverUrlValue
+        )
+        val descriptor = FileSaverDescriptor("导出接口文档", "选择保存位置")
+        val saveDialog = FileChooserFactory.getInstance().createSaveFileDialog(descriptor, project)
+        val basePath = project.basePath?.let { Paths.get(it) }
+        val wrapper = if (basePath != null) {
+            saveDialog.save(basePath, export.defaultFileName)
+        } else {
+            saveDialog.save(export.defaultFileName)
+        }
+        val file = wrapper?.file ?: return
+        Files.write(file.toPath(), export.bytes)
+        val message = "已导出 ${targets.size} 个接口到\n${file.toPath().toAbsolutePath()}\n格式: ${export.format.uppercase()}"
+        Messages.showInfoMessage(project, message, "导出完成")
+    }
+
+    private fun selectedRequestNodes(): List<HttpSavedRequest> {
+        return selectedRequests(includeGroupChildren = false)
+    }
+
+    private fun selectedRequests(includeGroupChildren: Boolean): List<HttpSavedRequest> {
+        val selectedPaths = apiTree.selectionPaths ?: return emptyList()
+        val result = LinkedHashMap<Long, HttpSavedRequest>()
+        selectedPaths.forEach { path ->
+            val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return@forEach
+            when (val userObject = node.userObject) {
+                is HttpSavedRequest -> {
+                    if (userObject.id > 0) {
+                        result[userObject.id] = userObject
+                    }
+                }
+                is HttpApiGroup -> {
+                    if (includeGroupChildren && userObject.id > 0) {
+                        collectRequestsForGroup(userObject.id).forEach { request ->
+                            if (request.id > 0) {
+                                result[request.id] = request
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return result.values.toList()
+    }
+
+    private fun selectedGroupNodes(includeChildren: Boolean): List<HttpApiGroup> {
+        val selectedPaths = apiTree.selectionPaths ?: return emptyList()
+        val result = LinkedHashMap<Long, HttpApiGroup>()
+        val selectedGroupIds = linkedSetOf<Long>()
+        selectedPaths.forEach { path ->
+            val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return@forEach
+            val group = node.userObject as? HttpApiGroup ?: return@forEach
+            if (group.id > 0) {
+                selectedGroupIds.add(group.id)
+                result[group.id] = group
+            }
+        }
+        if (includeChildren && selectedGroupIds.isNotEmpty()) {
+            collectGroupIds(selectedGroupIds).forEach { groupId ->
+                if (!result.containsKey(groupId)) {
+                    apiGroups.firstOrNull { it.id == groupId }?.let { group -> result[group.id] = group }
+                }
+            }
+        }
+        return result.values.toList()
+    }
+
+    private fun collectRequestsForGroup(groupId: Long): List<HttpSavedRequest> {
+        if (groupId <= 0) {
+            return emptyList()
+        }
+        val groupIds = linkedSetOf(groupId)
+        var changed = true
+        while (changed) {
+            changed = false
+            apiGroups.forEach { group ->
+                val parentId = group.parentId
+                if (parentId != null && groupIds.contains(parentId) && groupIds.add(group.id)) {
+                    changed = true
+                }
+            }
+        }
+        return apiRequests.filter { request ->
+            val gid = request.groupId
+            gid != null && groupIds.contains(gid)
+        }
+    }
+
+    private fun collectGroupIds(seedGroupIds: Collection<Long>): Set<Long> {
+        val groupIds = linkedSetOf<Long>()
+        seedGroupIds.filter { it > 0 }.forEach { groupIds.add(it) }
+        if (groupIds.isEmpty()) {
+            return emptySet()
+        }
+        var changed = true
+        while (changed) {
+            changed = false
+            apiGroups.forEach { group ->
+                val parentId = group.parentId
+                if (parentId != null && groupIds.contains(parentId) && groupIds.add(group.id)) {
+                    changed = true
+                }
+            }
+        }
+        return groupIds
     }
 
     private fun renameGroup(group: HttpApiGroup) {
@@ -656,10 +1029,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (confirm != Messages.YES) {
             return
         }
-        HttpApiStorage.deleteGroup(project, group.id)
-        apiGroups.removeIf { it.id == group.id }
-        apiRequests.removeIf { it.groupId == group.id }
-        rebuildApiTree()
+        deleteApiTargets(listOf(group), emptyList(), showResultMessage = false, confirmDeletion = false)
     }
 
     private fun renameRequest(request: HttpSavedRequest) {
@@ -694,12 +1064,70 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         HttpApiStorage.deleteRequest(project, request.id)
         apiRequests.removeIf { it.id == request.id }
         rebuildApiTree()
-        callTabs.filter { it.savedRequestId == request.id }.forEach { tab ->
+        val removedIds = setOf(request.id)
+        callTabs.filter { it.savedRequestId != null && removedIds.contains(it.savedRequestId) }.forEach { tab ->
             tab.savedRequestId = null
             tab.title = buildTabTitle(tab.draft, null)
             persistTabAsync(tab)
         }
         refreshCallTabTitles()
+    }
+
+    private fun deleteApiTargets(
+        groups: List<HttpApiGroup>,
+        requests: List<HttpSavedRequest>,
+        showResultMessage: Boolean = true,
+        confirmDeletion: Boolean = true
+    ) {
+        val selectedGroups = groups.filter { it.id > 0 }.distinctBy { it.id }
+        val selectedGroupIds = collectGroupIds(selectedGroups.map { it.id })
+        val selectedRequests = requests.filter { it.id > 0 }.distinctBy { it.id }
+        val requestIds = linkedSetOf<Long>()
+        selectedRequests.forEach { requestIds.add(it.id) }
+        if (selectedGroupIds.isNotEmpty()) {
+            apiRequests.forEach { request ->
+                val groupId = request.groupId
+                if (groupId != null && selectedGroupIds.contains(groupId) && request.id > 0) {
+                    requestIds.add(request.id)
+                }
+            }
+        }
+        if (selectedGroupIds.isEmpty() && requestIds.isEmpty()) {
+            Messages.showInfoMessage(project, "请先在接口列表中选择要删除的分组或接口。", "批量删除")
+            return
+        }
+        val groupCount = selectedGroupIds.size
+        val requestCount = requestIds.size
+        val detail = when {
+            groupCount > 0 && requestCount > 0 -> "$groupCount 个分组和 $requestCount 个接口"
+            groupCount > 0 -> "$groupCount 个分组"
+            else -> "$requestCount 个接口"
+        }
+        if (confirmDeletion) {
+            val confirm = Messages.showYesNoDialog(
+                project,
+                "确定删除选中的 $detail？",
+                "批量删除",
+                null
+            )
+            if (confirm != Messages.YES) {
+                return
+            }
+        }
+        requestIds.forEach { id -> HttpApiStorage.deleteRequest(project, id) }
+        selectedGroupIds.forEach { id -> HttpApiStorage.deleteGroup(project, id) }
+        apiRequests.removeIf { requestIds.contains(it.id) }
+        apiGroups.removeIf { selectedGroupIds.contains(it.id) }
+        rebuildApiTree()
+        callTabs.filter { it.savedRequestId != null && requestIds.contains(it.savedRequestId) }.forEach { tab ->
+            tab.savedRequestId = null
+            tab.title = buildTabTitle(tab.draft, null)
+            persistTabAsync(tab)
+        }
+        refreshCallTabTitles()
+        if (showResultMessage) {
+            Messages.showInfoMessage(project, "已删除 $detail。", "批量删除")
+        }
     }
 
     private fun persistCurrentTab() {
@@ -857,6 +1285,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             bodyType = when {
                 tab.draft.formFields.isNotEmpty() -> HttpBodyType.FORM_DATA
                 tab.draft.urlEncoded.isNotEmpty() -> HttpBodyType.FORM_URLENCODED
+                tab.draft.requestBodyParams.isNotEmpty() -> HttpBodyType.JSON
                 !tab.draft.body.isNullOrBlank() -> HttpBodyType.JSON
                 else -> HttpBodyType.NONE
             }
@@ -864,7 +1293,38 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         selectBodyType(bodyType)
         setTableEntries(urlEncodedModel, tab.draft.urlEncoded)
         setFormFields(tab.draft.formFields)
+        setTableEntries(requestDocParamsModel, tab.draft.requestBodyParams)
+        val responseStatusDocs = if (tab.draft.responseStatusDocs.isNotEmpty()) {
+            tab.draft.responseStatusDocs
+        } else {
+            val fallbackStatus = tab.draft.responseStatus.trim()
+            val fallbackDescription = tab.draft.responseDescription.orEmpty().trim()
+            if (fallbackStatus.isNotBlank() || fallbackDescription.isNotBlank()) {
+                listOf(HttpKeyValue(key = fallbackStatus, description = fallbackDescription))
+            } else {
+                emptyList()
+            }
+        }
+        setResponseStatusDocs(responseStatusDocs)
+        setTableEntries(responseDocParamsModel, tab.draft.responseParams)
         bodyArea.text = tab.draft.body ?: ""
+        if (tab.draft.requestBodyParams.isEmpty() && !tab.draft.body.isNullOrBlank()) {
+            parseDocEntriesFromJson(tab.draft.body.orEmpty())?.let { parsed ->
+                setTableEntries(requestDocParamsModel, parsed)
+            }
+        }
+        updateRequestDocumentation(tab.draft)
+        responseDocBodyEditor.text = tab.draft.responseBody ?: ""
+        responseDocBodyEditor.revalidate()
+        responseDocBodyEditor.repaint()
+        if (tab.draft.responseParams.isEmpty() && !tab.draft.responseBody.isNullOrBlank()) {
+            parseDocEntriesFromJson(tab.draft.responseBody.orEmpty())?.let { parsed ->
+                setTableEntries(responseDocParamsModel, parsed)
+            }
+        }
+        responseDocStatusField.text = tab.draft.responseStatus.ifBlank { responseStatusDocs.firstOrNull()?.key.orEmpty() }
+        responseDocContentTypeField.text = tab.draft.responseContentType.ifBlank { "application/json" }
+        responseDocDescriptionField.text = tab.draft.responseDescription ?: responseStatusDocs.firstOrNull()?.description.orEmpty()
         preScriptArea.text = tab.draft.preScript ?: ""
         postScriptArea.text = tab.draft.postScript ?: ""
         updateResponse(tabResponses[tab.id])
@@ -1143,14 +1603,21 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun cloneDraft(draft: HttpRequestDraft): HttpRequestDraft {
         return draft.copy(
-            pathParams = draft.pathParams.map { HttpKeyValue(it.key, it.value) }.toMutableList(),
-            params = draft.params.map { HttpKeyValue(it.key, it.value) }.toMutableList(),
-            headers = draft.headers.map { HttpKeyValue(it.key, it.value) }.toMutableList(),
-            urlEncoded = draft.urlEncoded.map { HttpKeyValue(it.key, it.value) }.toMutableList(),
+            pathParams = draft.pathParams.map { it.copy() }.toMutableList(),
+            params = draft.params.map { it.copy() }.toMutableList(),
+            headers = draft.headers.map { it.copy() }.toMutableList(),
+            urlEncoded = draft.urlEncoded.map { it.copy() }.toMutableList(),
             formFields = draft.formFields.map { HttpFormField(it.key, it.value, it.fieldType) }.toMutableList(),
+            requestBodyParams = draft.requestBodyParams.map { it.copy() }.toMutableList(),
             body = draft.body,
             preScript = draft.preScript,
-            postScript = draft.postScript
+            postScript = draft.postScript,
+            responseStatus = draft.responseStatus,
+            responseContentType = draft.responseContentType,
+            responseDescription = draft.responseDescription,
+            responseBody = draft.responseBody,
+            responseStatusDocs = draft.responseStatusDocs.map { it.copy() }.toMutableList(),
+            responseParams = draft.responseParams.map { it.copy() }.toMutableList()
         )
     }
 
@@ -1362,7 +1829,24 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         val params = getTableEntries(paramsModel)
         val headers = getTableEntries(headersModel)
         val bodyType = selectedBodyType()
-        val body = if (bodyType == HttpBodyType.JSON) bodyArea.text.ifBlank { null } else null
+        val body = if (bodyType == HttpBodyType.JSON) {
+            bodyArea.text.trim().ifBlank { requestDocBodyEditor.text.trim().ifBlank { null } }
+        } else {
+            null
+        }
+        val requestBodyParams = getTableEntries(requestDocParamsModel)
+        val responseStatus = responseDocStatusField.text.trim()
+        val responseDescription = responseDocDescriptionField.text.trim()
+        val responseStatusDocs = getResponseStatusDocs().let { rows ->
+            if (rows.isNotEmpty()) {
+                rows
+            } else if (responseStatus.isNotBlank() || responseDescription.isNotBlank()) {
+                mutableListOf(HttpKeyValue(key = responseStatus, value = "", description = responseDescription))
+            } else {
+                mutableListOf()
+            }
+        }
+        val responseParams = getTableEntries(responseDocParamsModel)
         val urlEncoded = getTableEntries(urlEncodedModel)
         val formFields = getFormFields()
         return HttpRequestDraft(
@@ -1376,9 +1860,18 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             bodyType = bodyType.name,
             urlEncoded = urlEncoded,
             formFields = formFields,
+            requestBodyParams = requestBodyParams,
             body = body,
             preScript = preScriptArea.text,
-            postScript = postScriptArea.text
+            postScript = postScriptArea.text,
+            responseStatus = responseStatus.ifBlank { responseStatusDocs.firstOrNull()?.key.orEmpty() },
+            responseContentType = responseDocContentTypeField.text.trim(),
+            responseDescription = responseDescription
+                .ifBlank { responseStatusDocs.firstOrNull()?.description.orEmpty().trim() }
+                .takeIf { it.isNotBlank() },
+            responseBody = responseDocBodyEditor.text.trim().ifBlank { null },
+            responseStatusDocs = responseStatusDocs,
+            responseParams = responseParams
         )
     }
 
@@ -1900,6 +2393,291 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         renderTabIfNeeded(responseTabs.selectedIndex)
     }
 
+    private fun updateRequestDocumentation(draft: HttpRequestDraft?) {
+        if (draft == null) {
+            requestDocExampleModeLabel.text = "请求体类型: 无"
+            updateEditorTextSafely(requestDocBodyEditor, "{}")
+            return
+        }
+        val bodyType = resolveRequestDocBodyType(draft)
+        requestDocExampleModeLabel.text = "请求体类型: ${bodyTypeLabel(bodyType)}"
+        updateEditorTextSafely(requestDocBodyEditor, buildRequestDocJsonExample(draft, bodyType))
+    }
+
+    private fun refreshRequestDocExampleFromUi() {
+        if (isLoading) {
+            return
+        }
+        val draft = buildDraftFromUI()
+        updateRequestDocumentation(draft)
+    }
+
+    private fun bodyTypeLabel(type: HttpBodyType): String {
+        return when (type) {
+            HttpBodyType.NONE -> "无"
+            HttpBodyType.JSON -> "JSON"
+            HttpBodyType.FORM_URLENCODED -> "x-www-form-urlencoded"
+            HttpBodyType.FORM_DATA -> "form-data"
+        }
+    }
+
+    private fun resolveRequestDocBodyType(draft: HttpRequestDraft): HttpBodyType {
+        var bodyType = parseBodyType(draft.bodyType)
+        if (bodyType == HttpBodyType.NONE) {
+            bodyType = when {
+                draft.formFields.isNotEmpty() -> HttpBodyType.FORM_DATA
+                draft.urlEncoded.isNotEmpty() -> HttpBodyType.FORM_URLENCODED
+                draft.requestBodyParams.isNotEmpty() -> HttpBodyType.JSON
+                !draft.body.isNullOrBlank() -> HttpBodyType.JSON
+                else -> HttpBodyType.NONE
+            }
+        }
+        return bodyType
+    }
+
+    private fun buildRequestDocJsonExample(draft: HttpRequestDraft, bodyType: HttpBodyType): String {
+        return when (bodyType) {
+            HttpBodyType.NONE -> "{}"
+            HttpBodyType.JSON -> {
+                val body = draft.body.orEmpty().trim()
+                when {
+                    body.isNotBlank() -> prettyJsonOrRaw(body)
+                    draft.requestBodyParams.isNotEmpty() -> buildJsonExampleFromDocRows(draft.requestBodyParams)
+                    else -> "{}"
+                }
+            }
+            HttpBodyType.FORM_URLENCODED -> {
+                val obj = linkedMapOf<String, Any?>()
+                draft.urlEncoded.filter { it.key.isNotBlank() }.forEach { row ->
+                    obj[row.key] = parseDocScalarValue(row.value)
+                }
+                runCatching { jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(obj) }
+                    .getOrDefault("{}")
+            }
+            HttpBodyType.FORM_DATA -> {
+                val obj = linkedMapOf<String, Any?>()
+                draft.formFields.filter { it.key.isNotBlank() }.forEach { row ->
+                    val type = parseFormFieldType(row.fieldType)
+                    obj[row.key] = if (type == HttpFormFieldType.FILE) {
+                        mapOf("type" to "FILE", "value" to row.value)
+                    } else {
+                        parseDocScalarValue(row.value)
+                    }
+                }
+                runCatching { jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(obj) }
+                    .getOrDefault("{}")
+            }
+        }
+    }
+
+    private fun prettyJsonOrRaw(value: String): String {
+        val text = value.trim()
+        if (text.isBlank()) {
+            return text
+        }
+        return runCatching {
+            jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(jsonMapper.readTree(text))
+        }.getOrDefault(text)
+    }
+
+    private fun buildJsonExampleFromDocRows(rows: List<HttpKeyValue>): String {
+        if (rows.isEmpty()) {
+            return "{}"
+        }
+        val root = linkedMapOf<String, Any?>()
+        rows.filter { it.key.isNotBlank() }.forEach { row ->
+            val segments = parseDocFieldSegments(row.key)
+            if (segments.isEmpty()) {
+                return@forEach
+            }
+            var current: Any? = root
+            segments.forEachIndexed { index, segment ->
+                val isLast = index == segments.lastIndex
+                if (segment.isArray) {
+                    val map = current as? MutableMap<String, Any?> ?: return@forEachIndexed
+                    val list = map.getOrPut(segment.name) { mutableListOf<Any?>() } as? MutableList<Any?> ?: return@forEachIndexed
+                    if (isLast) {
+                        if (list.isEmpty()) {
+                            list.add(parseDocScalarValue(row.value))
+                        } else {
+                            list[0] = parseDocScalarValue(row.value)
+                        }
+                    } else {
+                        val next = if (list.isNotEmpty() && list[0] is MutableMap<*, *>) {
+                            list[0] as MutableMap<String, Any?>
+                        } else {
+                            linkedMapOf<String, Any?>().also {
+                                if (list.isEmpty()) {
+                                    list.add(it)
+                                } else {
+                                    list[0] = it
+                                }
+                            }
+                        }
+                        current = next
+                    }
+                } else {
+                    val map = current as? MutableMap<String, Any?> ?: return@forEachIndexed
+                    if (isLast) {
+                        map[segment.name] = parseDocScalarValue(row.value)
+                    } else {
+                        val next = map[segment.name] as? MutableMap<String, Any?> ?: linkedMapOf<String, Any?>().also {
+                            map[segment.name] = it
+                        }
+                        current = next
+                    }
+                }
+            }
+        }
+        return runCatching {
+            jsonMapper.writerWithDefaultPrettyPrinter().writeValueAsString(root)
+        }.getOrDefault(root.toString())
+    }
+
+    private fun parseDocScalarValue(raw: String): Any? {
+        val text = raw.trim()
+        if (text.isBlank()) {
+            return ""
+        }
+        if (text.equals("true", ignoreCase = true)) {
+            return true
+        }
+        if (text.equals("false", ignoreCase = true)) {
+            return false
+        }
+        text.toIntOrNull()?.let { return it }
+        text.toLongOrNull()?.let { return it }
+        text.toDoubleOrNull()?.let { return it }
+        return text
+    }
+
+    private fun syncRequestBodyFromDocEditor() {
+        if (isLoading || syncingDocEditors) {
+            return
+        }
+        val bodyType = selectedBodyType()
+        if (bodyType != HttpBodyType.JSON) {
+            return
+        }
+        val text = requestDocBodyEditor.text.trim()
+        syncingDocEditors = true
+        try {
+            bodyArea.text = text
+            val existingDescriptions = getTableEntries(requestDocParamsModel)
+                .filter { it.key.isNotBlank() }
+                .associate { it.key to it.description }
+            val parsed = parseDocEntriesFromJson(text, existingDescriptions)
+            if (parsed != null) {
+                setTableEntries(requestDocParamsModel, parsed)
+            }
+        } finally {
+            syncingDocEditors = false
+        }
+    }
+
+    private fun updateEditorTextSafely(editor: MultiLanguageTextField, value: String) {
+        if (syncingDocEditors) {
+            return
+        }
+        val normalized = value.trim().ifBlank { "{}" }
+        if (editor.text.trim() == normalized) {
+            return
+        }
+        syncingDocEditors = true
+        try {
+            editor.text = normalized
+        } finally {
+            syncingDocEditors = false
+        }
+    }
+
+    private fun syncResponseDocParamsFromBody() {
+        if (isLoading) {
+            return
+        }
+        val body = responseDocBodyEditor.text.trim()
+        if (body.isBlank()) {
+            setTableEntries(responseDocParamsModel, emptyList())
+            return
+        }
+        val existingDescriptions = getTableEntries(responseDocParamsModel)
+            .filter { it.key.isNotBlank() }
+            .associate { it.key to it.description }
+        val parsed = parseDocEntriesFromJson(body, existingDescriptions) ?: return
+        setTableEntries(responseDocParamsModel, parsed)
+    }
+
+    private fun parseDocEntriesFromJson(
+        text: String,
+        descriptions: Map<String, String> = emptyMap()
+    ): MutableList<HttpKeyValue>? {
+        val root = runCatching { jsonMapper.readTree(text) }.getOrNull() ?: return null
+        val rows = LinkedHashMap<String, HttpKeyValue>()
+        collectDocEntriesFromJsonNode(root, "", rows)
+        rows.values.forEach { row ->
+            if (row.description.isBlank()) {
+                row.description = descriptions[row.key].orEmpty()
+            }
+        }
+        return rows.values.toMutableList()
+    }
+
+    private fun collectDocEntriesFromJsonNode(
+        node: JsonNode?,
+        path: String,
+        rows: LinkedHashMap<String, HttpKeyValue>
+    ) {
+        if (node == null || node.isMissingNode) {
+            return
+        }
+        when {
+            node.isObject -> {
+                if (path.isNotBlank()) {
+                    rows.putIfAbsent(path, HttpKeyValue(key = path))
+                }
+                val iterator = node.fields()
+                while (iterator.hasNext()) {
+                    val field = iterator.next()
+                    val childPath = if (path.isBlank()) field.key else "$path.${field.key}"
+                    collectDocEntriesFromJsonNode(field.value, childPath, rows)
+                }
+            }
+            node.isArray -> {
+                val arrayPath = when {
+                    path.isBlank() -> "items[]"
+                    path.endsWith("[]") -> "$path.items[]"
+                    else -> "$path[]"
+                }
+                if (node.size() == 0) {
+                    rows.putIfAbsent(arrayPath, HttpKeyValue(key = arrayPath))
+                    return
+                }
+                val first = node[0]
+                if (first == null || first.isNull || first.isValueNode) {
+                    rows[arrayPath] = HttpKeyValue(key = arrayPath, value = jsonNodeValueToDocValue(first))
+                } else {
+                    rows.putIfAbsent(arrayPath, HttpKeyValue(key = arrayPath))
+                    collectDocEntriesFromJsonNode(first, arrayPath, rows)
+                }
+            }
+            else -> {
+                val key = if (path.isBlank()) "value" else path
+                rows[key] = HttpKeyValue(key = key, value = jsonNodeValueToDocValue(node))
+            }
+        }
+    }
+
+    private fun jsonNodeValueToDocValue(node: JsonNode?): String {
+        if (node == null || node.isNull) {
+            return "null"
+        }
+        return when {
+            node.isTextual -> node.textValue()
+            node.isNumber || node.isBoolean -> node.asText()
+            else -> node.toString()
+        }
+    }
+
     private fun renderTabIfNeeded(tabIndex: Int) {
         val response = currentResponse ?: return
         when (tabIndex) {
@@ -2016,10 +2794,54 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun buildHttpClient(timeoutSeconds: Int): HttpClient {
-        return HttpClient.newBuilder()
+        val builder = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(timeoutSeconds.toLong()))
             .followRedirects(HttpClient.Redirect.NORMAL)
-            .build()
+        applyProxySettings(builder, uiSettings)
+        return builder.build()
+    }
+
+    private fun applyProxySettings(builder: HttpClient.Builder, settings: HttpUiSettings) {
+        if (!settings.proxyEnabled) {
+            return
+        }
+        val host = settings.proxyHost.trim()
+        val port = settings.proxyPort
+        if (host.isBlank() || port !in 1..65535) {
+            return
+        }
+        val proxyType = normalizeProxyType(settings.proxyType)
+        val selector = if (proxyType == "SOCKS") {
+            val proxyAddress = InetSocketAddress.createUnresolved(host, port)
+            val proxy = Proxy(Proxy.Type.SOCKS, proxyAddress)
+            object : ProxySelector() {
+                override fun select(uri: URI?): MutableList<Proxy> {
+                    return mutableListOf(proxy)
+                }
+
+                override fun connectFailed(uri: URI?, sa: SocketAddress?, ioe: IOException?) {
+                }
+            }
+        } else {
+            ProxySelector.of(InetSocketAddress.createUnresolved(host, port))
+        }
+        builder.proxy(selector)
+        val username = settings.proxyUsername.trim()
+        val password = settings.proxyPassword
+        if (username.isNotBlank() && password.isNotEmpty()) {
+            builder.authenticator(object : Authenticator() {
+                override fun getPasswordAuthentication(): PasswordAuthentication? {
+                    if (requestorType != RequestorType.PROXY) {
+                        return null
+                    }
+                    return PasswordAuthentication(username, password.toCharArray())
+                }
+            })
+        }
+    }
+
+    private fun normalizeProxyType(value: String?): String {
+        return if (value?.trim()?.equals("SOCKS", ignoreCase = true) == true) "SOCKS" else "HTTP"
     }
 
     private fun applyDefaultHeaders(headers: MutableList<HttpKeyValue>) {
@@ -2086,7 +2908,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         table.rowHeight = JBUI.scale(24)
         table.setShowGrid(false)
         val addAction = simpleAction("添加", "添加一行", HttpIcons.add) {
-            model.addRow(arrayOf("", ""))
+            model.addRow(Array(model.columnCount) { "" })
             val row = model.rowCount - 1
             if (row >= 0) {
                 table.editCellAt(row, 0)
@@ -2112,6 +2934,517 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         panel.add(toolbar.component, BorderLayout.NORTH)
         panel.add(JBScrollPane(table), BorderLayout.CENTER)
         return panel
+    }
+
+    private fun createDocKeyValuePanel(model: DefaultTableModel, emptyText: String): JPanel {
+        val root = DefaultMutableTreeNode(DocFieldTreeItem("root", "", false))
+        val treeModel = DefaultTreeModel(root)
+        val tree = Tree(treeModel)
+        tree.isRootVisible = false
+        tree.showsRootHandles = true
+        tree.emptyText.text = emptyText
+        tree.rowHeight = JBUI.scale(22)
+        tree.cellRenderer = object : ColoredTreeCellRenderer() {
+            override fun customizeCellRenderer(
+                tree: JTree,
+                value: Any?,
+                selected: Boolean,
+                expanded: Boolean,
+                leaf: Boolean,
+                row: Int,
+                hasFocus: Boolean
+            ) {
+                val node = value as? DefaultMutableTreeNode ?: return
+                val item = node.userObject as? DocFieldTreeItem ?: return
+                val nameText = if (item.isArray) "${item.name}[]" else item.name
+                append(nameText, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
+                if (item.description.isNotBlank()) {
+                    append("  | 说明: ${item.description}", SimpleTextAttributes.GRAY_ATTRIBUTES)
+                }
+                if (item.example.isNotBlank()) {
+                    val shortened = StringUtil.shortenTextWithEllipsis(item.example.replace("\n", " "), 48, 0)
+                    append("  | 示例: $shortened", SimpleTextAttributes.GRAY_ITALIC_ATTRIBUTES)
+                }
+                toolTipText = if (item.description.isBlank() && item.example.isBlank()) {
+                    item.fullPath
+                } else {
+                    buildString {
+                        append(item.fullPath)
+                        if (item.description.isNotBlank()) {
+                            append("\n说明: ").append(item.description)
+                        }
+                        if (item.example.isNotBlank()) {
+                            append("\n示例: ").append(item.example)
+                        }
+                    }
+                }
+            }
+        }
+        fun selectedNode(): DefaultMutableTreeNode? {
+            return tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode
+        }
+        fun doAddField() {
+            val parentNode = selectedNode()
+            val parentPath = (parentNode?.userObject as? DocFieldTreeItem)?.fullPath.orEmpty()
+            val initialPath = if (parentPath.isBlank()) "field" else "$parentPath.field"
+            val dialog = DocFieldEditDialog(project, initialPath, "", "")
+            if (!dialog.showAndGet()) {
+                return
+            }
+            val path = dialog.fieldPath.trim()
+            if (path.isBlank()) {
+                return
+            }
+            upsertDocModelRow(model, path, dialog.fieldValue.trim(), dialog.fieldDescription.trim())
+        }
+        fun doEditField() {
+            selectedNode()?.let { editDocTreeNode(model, it) }
+        }
+        fun doDeleteField() {
+            val node = selectedNode() ?: return
+            val item = node.userObject as? DocFieldTreeItem ?: return
+            if (item.fullPath.isBlank()) {
+                return
+            }
+            deleteDocTreeNode(model, item.fullPath)
+        }
+        fun doExpandAll() {
+            expandAllTreeRows(tree)
+        }
+        fun doCollapseAll() {
+            for (i in tree.rowCount - 1 downTo 1) {
+                tree.collapseRow(i)
+            }
+        }
+        val addAction = simpleAction("添加字段", "添加字段", HttpIcons.add) {
+            doAddField()
+        }
+        val editAction = object : AnAction("编辑字段", "编辑选中字段", AllIcons.Actions.Edit) {
+            override fun actionPerformed(e: AnActionEvent) {
+                val node = selectedNode()
+                if (node == null) {
+                    Messages.showInfoMessage(project, "请先选中一个字段", "编辑字段")
+                    return
+                }
+                editDocTreeNode(model, node)
+            }
+
+            override fun update(e: AnActionEvent) {
+                val node = selectedNode()
+                val item = node?.userObject as? DocFieldTreeItem
+                e.presentation.isEnabled = item != null && item.fullPath.isNotBlank()
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+        val deleteAction = object : AnAction("删除字段", "删除选中字段", HttpIcons.remove) {
+            override fun actionPerformed(e: AnActionEvent) {
+                val node = selectedNode()
+                val item = node?.userObject as? DocFieldTreeItem
+                if (item == null || item.fullPath.isBlank()) {
+                    Messages.showInfoMessage(project, "请先选中一个字段", "删除字段")
+                    return
+                }
+                deleteDocTreeNode(model, item.fullPath)
+            }
+
+            override fun update(e: AnActionEvent) {
+                val node = selectedNode()
+                val item = node?.userObject as? DocFieldTreeItem
+                e.presentation.isEnabled = item != null && item.fullPath.isNotBlank()
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+        val expandAction = simpleAction("展开", "展开全部", AllIcons.Actions.Expandall) {
+            doExpandAll()
+        }
+        val collapseAction = simpleAction("收起", "收起全部", AllIcons.Actions.Collapseall) {
+            doCollapseAll()
+        }
+        val toolbar = buildActionToolbar(
+            "HttpDocTreeToolbar",
+            listOf(addAction, editAction, deleteAction, expandAction, collapseAction),
+            tree
+        )
+        toolbar.setReservePlaceAutoPopupIcon(false)
+        toolbar.targetComponent = tree
+        tree.addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent) {
+                maybeShowDocTreePopup(e)
+            }
+
+            override fun mouseReleased(e: MouseEvent) {
+                maybeShowDocTreePopup(e)
+            }
+
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.clickCount == 2 && SwingUtilities.isLeftMouseButton(e)) {
+                    val path = tree.getPathForLocation(e.x, e.y) ?: return
+                    val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
+                    editDocTreeNode(model, node)
+                }
+            }
+
+            private fun maybeShowDocTreePopup(e: MouseEvent) {
+                if (!e.isPopupTrigger) {
+                    return
+                }
+                val path = tree.getPathForLocation(e.x, e.y) ?: return
+                tree.selectionPath = path
+                val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
+                showDocTreePopup(model, node, tree, e.x, e.y)
+            }
+        })
+
+        val refresh = {
+            refreshDocFieldTree(model, treeModel, root, tree)
+        }
+        model.addTableModelListener {
+            refresh()
+        }
+        refresh()
+
+        val panel = JPanel(BorderLayout(0, 6))
+        panel.add(
+            JBLabel("支持路径写法：data.id、items[].name；可右键/双击节点编辑，显示示例与说明。"),
+            BorderLayout.NORTH
+        )
+        val content = JPanel(BorderLayout(0, 6))
+        content.add(toolbar.component, BorderLayout.NORTH)
+        content.add(JBScrollPane(tree), BorderLayout.CENTER)
+        panel.add(content, BorderLayout.CENTER)
+        return panel
+    }
+
+    private fun refreshDocFieldTree(
+        model: DefaultTableModel,
+        treeModel: DefaultTreeModel,
+        root: DefaultMutableTreeNode,
+        tree: Tree
+    ) {
+        root.removeAllChildren()
+        val nodeIndex = LinkedHashMap<String, DefaultMutableTreeNode>()
+        val rows = mutableListOf<Triple<String, String, String>>()
+        for (row in 0 until model.rowCount) {
+            val key = (model.getValueAt(row, 0) as? String)?.trim().orEmpty()
+            if (key.isBlank()) {
+                continue
+            }
+            val example = (model.getValueAt(row, 1) as? String)?.trim().orEmpty()
+            val description = if (model.columnCount > 2) {
+                (model.getValueAt(row, 2) as? String)?.trim().orEmpty()
+            } else {
+                ""
+            }
+            rows.add(Triple(key, example, description))
+        }
+        val rowKeys = rows.map { it.first }.toSet()
+        rows.forEach { (key, example, description) ->
+            val segments = parseDocFieldSegments(key)
+            if (segments.isEmpty()) {
+                return@forEach
+            }
+            var parent = root
+            val pathBuilder = StringBuilder()
+            segments.forEachIndexed { index, segment ->
+                if (pathBuilder.isNotEmpty()) {
+                    pathBuilder.append(".")
+                }
+                pathBuilder.append(segment.pathToken)
+                val path = pathBuilder.toString()
+                val node = nodeIndex[path] ?: DefaultMutableTreeNode(
+                    DocFieldTreeItem(segment.name, path, segment.isArray)
+                ).also {
+                    parent.add(it)
+                    nodeIndex[path] = it
+                }
+                val item = node.userObject as? DocFieldTreeItem
+                if (item != null && index == segments.lastIndex) {
+                    if (example.isNotBlank()) {
+                        item.example = example
+                    }
+                    if (description.isNotBlank()) {
+                        item.description = description
+                    }
+                    if (segment.isArray && node.childCount == 0 && !hasDocDescendantPath(rowKeys, path)) {
+                        node.add(
+                            DefaultMutableTreeNode(
+                                DocFieldTreeItem(
+                                    name = "items",
+                                    fullPath = "",
+                                    isArray = false,
+                                    example = example,
+                                    description = ""
+                                )
+                            )
+                        )
+                    }
+                }
+                parent = node
+            }
+        }
+        treeModel.reload()
+        expandAllTreeRows(tree)
+    }
+
+    private fun hasDocDescendantPath(keys: Set<String>, path: String): Boolean {
+        if (path.isBlank()) {
+            return false
+        }
+        val prefix = "$path."
+        return keys.any { candidate ->
+            val key = candidate.trim()
+            key != path && key.startsWith(prefix)
+        }
+    }
+
+    private fun showDocTreePopup(
+        model: DefaultTableModel,
+        node: DefaultMutableTreeNode,
+        tree: Tree,
+        x: Int,
+        y: Int
+    ) {
+        val item = node.userObject as? DocFieldTreeItem ?: return
+        if (item.fullPath.isBlank()) {
+            return
+        }
+        val menu = JPopupMenu()
+        val editItem = JMenuItem("编辑字段")
+        editItem.addActionListener {
+            editDocTreeNode(model, node)
+        }
+        val deleteItem = JMenuItem("删除字段")
+        deleteItem.addActionListener {
+            deleteDocTreeNode(model, item.fullPath)
+        }
+        menu.add(editItem)
+        menu.add(deleteItem)
+        menu.show(tree, x, y)
+    }
+
+    private fun editDocTreeNode(model: DefaultTableModel, node: DefaultMutableTreeNode) {
+        val item = node.userObject as? DocFieldTreeItem ?: return
+        val oldPath = item.fullPath.trim()
+        if (oldPath.isBlank()) {
+            return
+        }
+        val existing = getTableEntries(model).firstOrNull { it.key == oldPath }
+        val dialog = DocFieldEditDialog(
+            project = project,
+            initialKey = oldPath,
+            initialValue = existing?.value ?: item.example,
+            initialDescription = existing?.description ?: item.description
+        )
+        if (!dialog.showAndGet()) {
+            return
+        }
+        val newPath = dialog.fieldPath.trim()
+        if (newPath.isBlank()) {
+            Messages.showWarningDialog(project, "字段名不能为空", "编辑字段")
+            return
+        }
+        val newValue = dialog.fieldValue.trim()
+        val newDescription = dialog.fieldDescription.trim()
+
+        if (newPath != oldPath) {
+            renameDocFieldPrefix(model, oldPath, newPath)
+        }
+        upsertDocModelRow(model, newPath, newValue, newDescription)
+    }
+
+    private fun deleteDocTreeNode(model: DefaultTableModel, path: String) {
+        val target = path.trim()
+        if (target.isBlank()) {
+            return
+        }
+        val confirm = Messages.showYesNoDialog(
+            project,
+            "确定删除字段 `$target` 及其子字段吗？",
+            "删除字段",
+            null
+        )
+        if (confirm != Messages.YES) {
+            return
+        }
+        val filtered = getTableEntries(model)
+            .filterNot { isDocPathMatchOrDescendant(it.key, target) }
+        setTableEntries(model, filtered)
+    }
+
+    private fun renameDocFieldPrefix(model: DefaultTableModel, oldPrefix: String, newPrefix: String) {
+        val renamed = getTableEntries(model).map { row ->
+            if (isDocPathMatchOrDescendant(row.key, oldPrefix)) {
+                row.copy(key = newPrefix + row.key.removePrefix(oldPrefix))
+            } else {
+                row.copy()
+            }
+        }
+        setTableEntries(model, deduplicateDocEntries(renamed))
+    }
+
+    private fun upsertDocModelRow(
+        model: DefaultTableModel,
+        key: String,
+        value: String,
+        description: String
+    ) {
+        for (row in 0 until model.rowCount) {
+            val existingKey = (model.getValueAt(row, 0) as? String)?.trim().orEmpty()
+            if (existingKey == key) {
+                model.setValueAt(value, row, 1)
+                if (model.columnCount > 2) {
+                    model.setValueAt(description, row, 2)
+                }
+                return
+            }
+        }
+        if (model.columnCount > 2) {
+            model.addRow(arrayOf(key, value, description))
+        } else {
+            model.addRow(arrayOf(key, value))
+        }
+    }
+
+    private fun deduplicateDocEntries(entries: List<HttpKeyValue>): MutableList<HttpKeyValue> {
+        val map = LinkedHashMap<String, HttpKeyValue>()
+        entries.forEach { row ->
+            val key = row.key.trim()
+            if (key.isBlank()) {
+                return@forEach
+            }
+            val existing = map[key]
+            if (existing == null) {
+                map[key] = row.copy(key = key)
+            } else {
+                if (row.value.isNotBlank()) {
+                    existing.value = row.value
+                }
+                if (row.description.isNotBlank()) {
+                    existing.description = row.description
+                }
+            }
+        }
+        return map.values.toMutableList()
+    }
+
+    private fun isDocPathMatchOrDescendant(candidate: String, parentPath: String): Boolean {
+        val key = candidate.trim()
+        val path = parentPath.trim()
+        if (key.isBlank() || path.isBlank()) {
+            return false
+        }
+        return key == path || key.startsWith("$path.")
+    }
+
+    private fun parseDocFieldSegments(path: String): List<DocFieldPathSegment> {
+        val normalized = path.trim()
+        if (normalized.isBlank()) {
+            return emptyList()
+        }
+        val segments = mutableListOf<DocFieldPathSegment>()
+        normalized.split(".").forEach { raw ->
+            var part = raw.trim()
+            if (part.isBlank()) {
+                return@forEach
+            }
+            var arrayDepth = 0
+            while (part.endsWith("[]")) {
+                arrayDepth++
+                part = part.removeSuffix("[]").trim()
+            }
+            if (part.isNotBlank()) {
+                segments.add(
+                    DocFieldPathSegment(
+                        name = part,
+                        isArray = arrayDepth > 0,
+                        pathToken = if (arrayDepth > 0) "$part[]" else part
+                    )
+                )
+            }
+            if (arrayDepth > 1) {
+                repeat(arrayDepth - 1) {
+                    segments.add(
+                        DocFieldPathSegment(
+                            name = "items",
+                            isArray = true,
+                            pathToken = "items[]"
+                        )
+                    )
+                }
+            } else if (arrayDepth == 1 && part.isBlank()) {
+                segments.add(
+                    DocFieldPathSegment(
+                        name = "items",
+                        isArray = true,
+                        pathToken = "items[]"
+                    )
+                )
+            }
+        }
+        return segments
+    }
+
+    private fun expandAllTreeRows(tree: Tree) {
+        var row = 0
+        while (row < tree.rowCount) {
+            tree.expandRow(row)
+            row++
+        }
+    }
+
+    private fun createDocCardsContainer(cards: List<JComponent>): JComponent {
+        val content = JPanel()
+        content.layout = BoxLayout(content, BoxLayout.Y_AXIS)
+        cards.forEachIndexed { index, card ->
+            card.alignmentX = LEFT_ALIGNMENT
+            content.add(card)
+            if (index < cards.lastIndex) {
+                content.add(Box.createVerticalStrut(JBUI.scale(8)))
+            }
+        }
+        val wrapper = JPanel(BorderLayout())
+        wrapper.add(content, BorderLayout.NORTH)
+        return JBScrollPane(wrapper)
+    }
+
+    private fun createCollapsibleCard(
+        title: String,
+        content: JComponent,
+        collapsedInitially: Boolean
+    ): JPanel {
+        val contentPanel = JPanel(BorderLayout()).apply {
+            add(content, BorderLayout.CENTER)
+            isVisible = !collapsedInitially
+        }
+        val toggleButton = JButton(if (collapsedInitially) "展开" else "收起").apply {
+            isFocusable = false
+            margin = JBUI.insets(1, 8)
+        }
+        toggleButton.addActionListener {
+            val willExpand = !contentPanel.isVisible
+            contentPanel.isVisible = willExpand
+            toggleButton.text = if (willExpand) "收起" else "展开"
+            contentPanel.revalidate()
+            contentPanel.repaint()
+        }
+        val header = JPanel(BorderLayout(6, 0))
+        header.add(JBLabel(title), BorderLayout.WEST)
+        header.add(toggleButton, BorderLayout.EAST)
+
+        return JPanel(BorderLayout(0, 6)).apply {
+            border = JBUI.Borders.compound(
+                JBUI.Borders.customLine(JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground(), 1),
+                JBUI.Borders.empty(8)
+            )
+            add(header, BorderLayout.NORTH)
+            add(contentPanel, BorderLayout.CENTER)
+        }
     }
 
     private fun createScriptPanel(editor: MultiLanguageTextField, phase: ScriptPhase): JPanel {
@@ -2336,17 +3669,90 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         for (row in 0 until model.rowCount) {
             val key = (model.getValueAt(row, 0) as? String)?.trim().orEmpty()
             val value = (model.getValueAt(row, 1) as? String)?.trim().orEmpty()
+            val description = if (model.columnCount > 2) {
+                (model.getValueAt(row, 2) as? String)?.trim().orEmpty()
+            } else {
+                ""
+            }
             if (key.isNotBlank() || value.isNotBlank()) {
-                entries.add(HttpKeyValue(key, value))
+                entries.add(HttpKeyValue(key, value, description))
             }
         }
         return entries
     }
 
-    private fun setTableEntries(model: DefaultTableModel, entries: List<HttpKeyValue>) {
-        model.setRowCount(0)
+    private fun getResponseStatusDocs(): MutableList<HttpKeyValue> {
+        val entries = mutableListOf<HttpKeyValue>()
+        for (row in 0 until responseStatusDocsModel.rowCount) {
+            val status = (responseStatusDocsModel.getValueAt(row, 0) as? String)?.trim().orEmpty()
+            val description = (responseStatusDocsModel.getValueAt(row, 1) as? String)?.trim().orEmpty()
+            if (status.isNotBlank() || description.isNotBlank()) {
+                entries.add(HttpKeyValue(key = status, value = "", description = description))
+            }
+        }
+        return entries
+    }
+
+    private fun setResponseStatusDocs(entries: List<HttpKeyValue>) {
+        responseStatusDocsModel.setRowCount(0)
         entries.forEach { entry ->
-            model.addRow(arrayOf(entry.key, entry.value))
+            responseStatusDocsModel.addRow(arrayOf(entry.key, entry.description))
+        }
+    }
+
+    private fun setTableEntries(model: DefaultTableModel, entries: List<HttpKeyValue>) {
+        val normalizedEntries = if (model === requestDocParamsModel || model === responseDocParamsModel) {
+            normalizeArrayDocEntries(entries)
+        } else {
+            entries
+        }
+        model.setRowCount(0)
+        normalizedEntries.forEach { entry ->
+            if (model.columnCount > 2) {
+                model.addRow(arrayOf(entry.key, entry.value, entry.description))
+            } else {
+                model.addRow(arrayOf(entry.key, entry.value))
+            }
+        }
+    }
+
+    private fun normalizeArrayDocEntries(entries: List<HttpKeyValue>): List<HttpKeyValue> {
+        val ordered = LinkedHashMap<String, HttpKeyValue>()
+        entries.forEach { row ->
+            val key = row.key.trim()
+            if (key.isBlank()) {
+                return@forEach
+            }
+            val normalized = row.copy(key = key)
+            val existing = ordered[key]
+            if (existing == null) {
+                ordered[key] = normalized
+            } else {
+                if (existing.value.isBlank() && normalized.value.isNotBlank()) {
+                    existing.value = normalized.value
+                }
+                if (existing.description.isBlank() && normalized.description.isNotBlank()) {
+                    existing.description = normalized.description
+                }
+            }
+        }
+        val keys = ordered.keys.toSet()
+        ordered.values.forEach { row ->
+            val key = row.key
+            if (!key.endsWith("[]")) {
+                return@forEach
+            }
+            val baseKey = key.removeSuffix("[]")
+            val baseRow = ordered[baseKey] ?: return@forEach
+            if (row.value.isBlank() && baseRow.value.isNotBlank()) {
+                row.value = baseRow.value
+            }
+            if (row.description.isBlank() && baseRow.description.isNotBlank()) {
+                row.description = baseRow.description
+            }
+        }
+        return ordered.values.filterNot { row ->
+            !row.key.endsWith("[]") && keys.contains("${row.key}[]")
         }
     }
 
@@ -2881,6 +4287,33 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         responseActionsToolbar?.updateActionsImmediately()
     }
 
+    private fun toggleResponsePanelCollapsed() {
+        applyResponsePanelCollapsed(!responsePanelCollapsed, rememberCurrent = true)
+    }
+
+    private fun applyResponsePanelCollapsed(collapsed: Boolean, rememberCurrent: Boolean) {
+        if (!::requestResponseSplit.isInitialized || !::responseTabs.isInitialized || !::responseCollapseButton.isInitialized) {
+            return
+        }
+        if (collapsed) {
+            if (rememberCurrent && !responsePanelCollapsed) {
+                responseExpandedProportion = requestResponseSplit.proportion.coerceIn(0.35f, 0.92f)
+            }
+            responseTabs.isVisible = false
+            requestResponseSplit.proportion = 0.995f
+            responseCollapseButton.text = "展开响应"
+            responseCollapseButton.toolTipText = "展开响应区域"
+        } else {
+            responseTabs.isVisible = true
+            requestResponseSplit.proportion = responseExpandedProportion.coerceIn(0.35f, 0.92f)
+            responseCollapseButton.text = "收起响应"
+            responseCollapseButton.toolTipText = "收起响应区域"
+        }
+        responsePanelCollapsed = collapsed
+        requestResponseSplit.revalidate()
+        requestResponseSplit.repaint()
+    }
+
 
     private fun formatBytes(bytes: Long): String {
         val size = max(bytes, 0)
@@ -3024,10 +4457,10 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         fromUrl: List<HttpKeyValue>,
         fromTable: List<HttpKeyValue>
     ): MutableList<HttpKeyValue> {
-        val merged = linkedMapOf<String, String>()
-        fromUrl.filter { it.key.isNotBlank() }.forEach { merged[it.key] = it.value }
-        fromTable.filter { it.key.isNotBlank() }.forEach { merged[it.key] = it.value }
-        return merged.map { HttpKeyValue(it.key, it.value) }.toMutableList()
+        val merged = linkedMapOf<String, HttpKeyValue>()
+        fromUrl.filter { it.key.isNotBlank() }.forEach { merged[it.key] = it.copy() }
+        fromTable.filter { it.key.isNotBlank() }.forEach { merged[it.key] = it.copy() }
+        return merged.values.toMutableList()
     }
 
     private fun buildUrl(baseUrl: String, params: List<HttpKeyValue>): String {
@@ -3110,6 +4543,72 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         val panel = JPanel(BorderLayout(0, 6))
         panel.add(header, BorderLayout.NORTH)
         panel.add(bodyCardPanel, BorderLayout.CENTER)
+        return panel
+    }
+
+    private fun buildApiDocPanel(): JPanel {
+        val requestParamsPanel = createDocKeyValuePanel(requestDocParamsModel, "请求字段")
+        val responseStatusPanel = createKeyValuePanel(responseStatusDocsModel, "响应状态码")
+        val responseParamsPanel = createDocKeyValuePanel(responseDocParamsModel, "响应字段")
+
+        val responseMeta = JPanel(GridBagLayout())
+        val c = GridBagConstraints().apply {
+            gridx = 0
+            gridy = 0
+            weightx = 0.0
+            fill = GridBagConstraints.HORIZONTAL
+            insets = JBUI.insets(2, 0, 2, 6)
+        }
+        responseMeta.add(JBLabel("响应状态"), c)
+        c.gridx = 1
+        c.weightx = 1.0
+        responseMeta.add(responseDocStatusField, c)
+
+        c.gridx = 0
+        c.gridy++
+        c.weightx = 0.0
+        responseMeta.add(JBLabel("响应类型"), c)
+        c.gridx = 1
+        c.weightx = 1.0
+        responseMeta.add(responseDocContentTypeField, c)
+
+        c.gridx = 0
+        c.gridy++
+        c.weightx = 0.0
+        responseMeta.add(JBLabel("响应说明"), c)
+        c.gridx = 1
+        c.weightx = 1.0
+        responseMeta.add(responseDocDescriptionField, c)
+
+        val requestExamplePanel = JPanel(BorderLayout(0, 6))
+        requestExamplePanel.add(requestDocExampleModeLabel, BorderLayout.NORTH)
+        requestExamplePanel.add(requestDocBodyEditor, BorderLayout.CENTER)
+
+        val responseExamplePanel = JPanel(BorderLayout(0, 6))
+        responseExamplePanel.add(responseDocBodyEditor, BorderLayout.CENTER)
+
+        val requestDocContainer = createDocCardsContainer(
+            listOf(
+                createCollapsibleCard("请求参数说明（可编辑）", requestParamsPanel, collapsedInitially = false),
+                createCollapsibleCard("请求示例（JSON 编辑器）", requestExamplePanel, collapsedInitially = false)
+            )
+        )
+        val responseDocContainer = createDocCardsContainer(
+            listOf(
+                createCollapsibleCard("响应元信息（可编辑）", responseMeta, collapsedInitially = false),
+                createCollapsibleCard("响应状态码说明（可编辑）", responseStatusPanel, collapsedInitially = false),
+                createCollapsibleCard("响应参数说明（可编辑）", responseParamsPanel, collapsedInitially = false),
+                createCollapsibleCard("响应示例（JSON 编辑器）", responseExamplePanel, collapsedInitially = false)
+            )
+        )
+
+        val docTabs = JBTabbedPane()
+        docTabs.addTab("请求文档", requestDocContainer)
+        docTabs.addTab("响应文档", responseDocContainer)
+
+        val panel = JPanel(BorderLayout(0, 6))
+        panel.add(JBLabel("说明：请求参数与响应参数已分开展示；每个卡片可单独收起/展开。"), BorderLayout.NORTH)
+        panel.add(docTabs, BorderLayout.CENTER)
         return panel
     }
 
@@ -3660,11 +5159,22 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         private val timeoutField = JBTextField(settings.defaultTimeoutSeconds.toString())
         private val rawLimitField = JBTextField(settings.maxRawViewChars.toString())
         private val renderLimitField = JBTextField(settings.maxRenderChars.toString())
+        private val proxyEnabledBox = JBCheckBox("启用代理", settings.proxyEnabled)
+        private val proxyTypeBox = JComboBox(PROXY_TYPES)
+        private val proxyHostField = JBTextField(settings.proxyHost)
+        private val proxyPortField = JBTextField(if (settings.proxyPort in 1..65535) settings.proxyPort.toString() else "")
+        private val proxyUsernameField = JBTextField(settings.proxyUsername)
+        private val proxyPasswordField = JBPasswordField().apply {
+            text = settings.proxyPassword
+        }
         private val lineMarkerEnabledBox = JBCheckBox("显示可调用图标", settings.lineMarkerEnabled)
         private val contextMenuEnabledBox = JBCheckBox("显示右键添加菜单", settings.contextMenuEnabled)
 
         init {
             title = "设置"
+            proxyTypeBox.selectedItem = normalizeProxyType(settings.proxyType)
+            proxyEnabledBox.addActionListener { updateProxyFieldsEnabled() }
+            updateProxyFieldsEnabled()
             init()
         }
 
@@ -3698,6 +5208,38 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             c.gridy++
             panel.add(contextMenuEnabledBox, c)
 
+            c.gridy++
+            panel.add(JSeparator(), c)
+
+            c.gridy++
+            panel.add(proxyEnabledBox, c)
+
+            c.gridy++
+            panel.add(JBLabel("代理类型"), c)
+            c.gridy++
+            panel.add(proxyTypeBox, c)
+
+            c.gridy++
+            panel.add(JBLabel("代理地址"), c)
+            c.gridy++
+            panel.add(proxyHostField, c)
+
+            c.gridy++
+            panel.add(JBLabel("代理端口"), c)
+            c.gridy++
+            panel.add(proxyPortField, c)
+
+            c.gridy++
+            panel.add(JBLabel("代理用户名(可选)"), c)
+            c.gridy++
+            panel.add(proxyUsernameField, c)
+
+            c.gridy++
+            panel.add(JBLabel("代理密码(可选)"), c)
+            c.gridy++
+            panel.add(proxyPasswordField, c)
+
+            panel.preferredSize = JBUI.size(350, 0)
             return panel
         }
 
@@ -3717,6 +5259,21 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             if (renderLimit != 0 && renderLimit !in MIN_PREVIEW_CHARS..MAX_PREVIEW_CHARS) {
                 return ValidationInfo("范围 0(不限) 或 $MIN_PREVIEW_CHARS-$MAX_PREVIEW_CHARS", renderLimitField)
             }
+            if (proxyEnabledBox.isSelected) {
+                if (proxyHostField.text.trim().isBlank()) {
+                    return ValidationInfo("启用代理后，代理地址不能为空", proxyHostField)
+                }
+                val port = proxyPortField.text.trim().toIntOrNull()
+                    ?: return ValidationInfo("代理端口必须是数字", proxyPortField)
+                if (port !in 1..65535) {
+                    return ValidationInfo("代理端口范围 1-65535", proxyPortField)
+                }
+                val username = proxyUsernameField.text.trim()
+                val password = String(proxyPasswordField.password)
+                if ((username.isBlank() && password.isNotBlank()) || (username.isNotBlank() && password.isBlank())) {
+                    return ValidationInfo("代理认证需要同时填写用户名和密码，或全部留空", proxyUsernameField)
+                }
+            }
             return null
         }
 
@@ -3726,8 +5283,23 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                 maxRawViewChars = rawLimitField.text.trim().toIntOrNull() ?: uiSettings.maxRawViewChars,
                 maxRenderChars = renderLimitField.text.trim().toIntOrNull() ?: uiSettings.maxRenderChars,
                 lineMarkerEnabled = lineMarkerEnabledBox.isSelected,
-                contextMenuEnabled = contextMenuEnabledBox.isSelected
+                contextMenuEnabled = contextMenuEnabledBox.isSelected,
+                proxyEnabled = proxyEnabledBox.isSelected,
+                proxyType = normalizeProxyType(proxyTypeBox.selectedItem?.toString()),
+                proxyHost = proxyHostField.text.trim(),
+                proxyPort = proxyPortField.text.trim().toIntOrNull() ?: 0,
+                proxyUsername = proxyUsernameField.text.trim(),
+                proxyPassword = String(proxyPasswordField.password)
             )
+        }
+
+        private fun updateProxyFieldsEnabled() {
+            val enabled = proxyEnabledBox.isSelected
+            proxyTypeBox.isEnabled = enabled
+            proxyHostField.isEnabled = enabled
+            proxyPortField.isEnabled = enabled
+            proxyUsernameField.isEnabled = enabled
+            proxyPasswordField.isEnabled = enabled
         }
     }
 
@@ -3892,6 +5464,253 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
+    private inner class DocFieldEditDialog(
+        project: Project,
+        initialKey: String,
+        initialValue: String,
+        initialDescription: String
+    ) : DialogWrapper(project) {
+        private val keyField = JBTextField(initialKey)
+        private val valueField = JBTextField(initialValue)
+        private val descriptionField = JBTextField(initialDescription)
+
+        val fieldPath: String
+            get() = keyField.text
+        val fieldValue: String
+            get() = valueField.text
+        val fieldDescription: String
+            get() = descriptionField.text
+
+        init {
+            title = "编辑字段"
+            init()
+        }
+
+        override fun createCenterPanel(): JComponent {
+            val panel = JPanel(GridBagLayout())
+            val c = GridBagConstraints().apply {
+                gridx = 0
+                gridy = 0
+                weightx = 0.0
+                fill = GridBagConstraints.HORIZONTAL
+                insets = JBUI.insets(4)
+            }
+            panel.add(JBLabel("字段路径"), c)
+            c.gridx = 1
+            c.weightx = 1.0
+            panel.add(keyField, c)
+
+            c.gridx = 0
+            c.gridy++
+            c.weightx = 0.0
+            panel.add(JBLabel("示例值"), c)
+            c.gridx = 1
+            c.weightx = 1.0
+            panel.add(valueField, c)
+
+            c.gridx = 0
+            c.gridy++
+            c.weightx = 0.0
+            panel.add(JBLabel("描述"), c)
+            c.gridx = 1
+            c.weightx = 1.0
+            panel.add(descriptionField, c)
+
+            return panel
+        }
+
+        override fun doValidate(): ValidationInfo? {
+            if (keyField.text.trim().isBlank()) {
+                return ValidationInfo("字段路径不能为空", keyField)
+            }
+            return null
+        }
+    }
+
+    private inner class ImportApiDialog(
+        project: Project
+    ) : DialogWrapper(project) {
+        private val sourceBox = JComboBox(IMPORT_SOURCE_OPTIONS)
+        private val formLayout = CardLayout()
+        private val formPanel = JPanel(formLayout)
+        private val filePathField = JBTextField()
+        private val urlField = JBTextField("http://localhost:8080/v3/api-docs")
+        private val jsonEditor = MultiLanguageTextField(JsonFileType.INSTANCE, project)
+
+        val sourceType: HttpApiSpecImportService.SourceType
+            get() = when (sourceBox.selectedIndex) {
+                1 -> HttpApiSpecImportService.SourceType.URL
+                2 -> HttpApiSpecImportService.SourceType.JSON
+                else -> HttpApiSpecImportService.SourceType.FILE
+            }
+
+        val filePath: String
+            get() = filePathField.text.trim()
+
+        val url: String
+            get() = urlField.text.trim()
+
+        val json: String
+            get() = jsonEditor.text.trim()
+
+        init {
+            title = "导入 OpenAPI/Swagger"
+            sourceBox.addActionListener { switchForm() }
+            init()
+            switchForm()
+        }
+
+        override fun createCenterPanel(): JComponent {
+            val filePanel = JPanel(BorderLayout(0, 6))
+            val fileRow = JPanel(BorderLayout(6, 0))
+            val chooseButton = JButton("选择文件")
+            chooseButton.addActionListener { chooseImportFile() }
+            fileRow.add(filePathField, BorderLayout.CENTER)
+            fileRow.add(chooseButton, BorderLayout.EAST)
+            filePanel.add(fileRow, BorderLayout.NORTH)
+            filePanel.add(JBLabel("请选择本地 OpenAPI/Swagger JSON 文件。"), BorderLayout.CENTER)
+
+            val urlPanel = JPanel(BorderLayout(0, 6))
+            urlPanel.add(JBLabel("可使用设置中的代理配置发起远程导入。"), BorderLayout.NORTH)
+            urlPanel.add(urlField, BorderLayout.NORTH)
+
+            val jsonPanel = JPanel(BorderLayout(0, 6))
+            jsonPanel.add(JBLabel("请粘贴 OpenAPI/Swagger JSON 文档"), BorderLayout.NORTH)
+            jsonPanel.add(jsonEditor, BorderLayout.CENTER)
+
+            formPanel.add(filePanel, HttpApiSpecImportService.SourceType.FILE.name)
+            formPanel.add(urlPanel, HttpApiSpecImportService.SourceType.URL.name)
+            formPanel.add(jsonPanel, HttpApiSpecImportService.SourceType.JSON.name)
+
+            val panel = JPanel(BorderLayout(0, 8))
+            panel.preferredSize = JBUI.size(760, 360)
+            panel.add(JBLabel("导入方式"), BorderLayout.NORTH)
+            val top = JPanel(BorderLayout(0, 6))
+            top.add(sourceBox, BorderLayout.NORTH)
+            top.add(formPanel, BorderLayout.CENTER)
+            panel.add(top, BorderLayout.CENTER)
+            return panel
+        }
+
+        override fun doValidate(): ValidationInfo? {
+            return when (sourceType) {
+                HttpApiSpecImportService.SourceType.FILE -> {
+                    if (filePath.isBlank()) {
+                        ValidationInfo("请选择 JSON 文件", filePathField)
+                    } else {
+                        val path = runCatching { Paths.get(filePath) }.getOrNull()
+                        if (path == null || !Files.exists(path) || !Files.isRegularFile(path)) {
+                            ValidationInfo("文件不存在或不可读", filePathField)
+                        } else {
+                            null
+                        }
+                    }
+                }
+                HttpApiSpecImportService.SourceType.URL -> {
+                    if (url.isBlank()) {
+                        ValidationInfo("请输入 URL", urlField)
+                    } else if (runCatching { URI(url) }.isFailure) {
+                        ValidationInfo("URL 格式不正确", urlField)
+                    } else {
+                        null
+                    }
+                }
+                HttpApiSpecImportService.SourceType.JSON -> {
+                    if (json.isBlank()) {
+                        ValidationInfo("JSON 不能为空", jsonEditor)
+                    } else {
+                        null
+                    }
+                }
+            }
+        }
+
+        private fun switchForm() {
+            formLayout.show(formPanel, sourceType.name)
+        }
+
+        private fun chooseImportFile() {
+            val descriptor = FileChooserDescriptorFactory.createSingleFileDescriptor("json")
+            descriptor.title = "选择 OpenAPI/Swagger JSON 文件"
+            FileChooser.chooseFile(descriptor, project, null) { file ->
+                filePathField.text = file.path
+            }
+        }
+    }
+
+    private inner class ExportApiDialog(
+        project: Project,
+        requestCount: Int
+    ) : DialogWrapper(project) {
+        private val formatBox = JComboBox(EXPORT_FORMAT_OPTIONS)
+        private val titleField = JBTextField("HTTP API")
+        private val versionField = JBTextField("1.0.0")
+        private val serverField = JBTextField("")
+        private val countLabel = JBLabel("将导出 $requestCount 个接口")
+
+        val format: String
+            get() = (formatBox.selectedItem as? ExportFormatOption)?.format ?: "openapi"
+
+        val titleValue: String
+            get() = titleField.text.trim().ifBlank { "HTTP API" }
+
+        val versionValue: String
+            get() = versionField.text.trim().ifBlank { "1.0.0" }
+
+        val serverUrlValue: String
+            get() = serverField.text.trim()
+
+        init {
+            title = "导出接口文档"
+            init()
+        }
+
+        override fun createCenterPanel(): JComponent {
+            val panel = JPanel(GridBagLayout())
+            val c = GridBagConstraints().apply {
+                fill = GridBagConstraints.HORIZONTAL
+                weightx = 1.0
+                gridx = 0
+                gridy = 0
+                insets = JBUI.insets(4)
+            }
+            panel.preferredSize = JBUI.size(420, 0)
+
+            panel.add(countLabel, c)
+            c.gridy++
+            panel.add(JBLabel("导出格式"), c)
+            c.gridy++
+            panel.add(formatBox, c)
+
+            c.gridy++
+            panel.add(JBLabel("文档标题"), c)
+            c.gridy++
+            panel.add(titleField, c)
+
+            c.gridy++
+            panel.add(JBLabel("版本"), c)
+            c.gridy++
+            panel.add(versionField, c)
+
+            c.gridy++
+            panel.add(JBLabel("服务地址(可选)"), c)
+            c.gridy++
+            panel.add(serverField, c)
+
+            return panel
+        }
+
+        override fun doValidate(): ValidationInfo? {
+            if (titleField.text.trim().isBlank()) {
+                return ValidationInfo("文档标题不能为空", titleField)
+            }
+            if (versionField.text.trim().isBlank()) {
+                return ValidationInfo("版本不能为空", versionField)
+            }
+            return null
+        }
+    }
+
     private enum class ScriptPhase {
         PRE,
         POST
@@ -3908,6 +5727,26 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
+    private data class ExportFormatOption(val label: String, val format: String) {
+        override fun toString(): String {
+            return label
+        }
+    }
+
+    private data class DocFieldPathSegment(
+        val name: String,
+        val isArray: Boolean,
+        val pathToken: String
+    )
+
+    private data class DocFieldTreeItem(
+        val name: String,
+        val fullPath: String,
+        val isArray: Boolean,
+        var example: String = "",
+        var description: String = ""
+    )
+
     companion object {
         private val HTTP_METHODS = arrayOf("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
         private val BODY_TYPES = arrayOf(
@@ -3915,6 +5754,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             BodyTypeOption("JSON", HttpBodyType.JSON),
             BodyTypeOption("x-www-form-urlencoded", HttpBodyType.FORM_URLENCODED),
             BodyTypeOption("form-data", HttpBodyType.FORM_DATA)
+        )
+        private val PROXY_TYPES = arrayOf("HTTP", "SOCKS")
+        private val IMPORT_SOURCE_OPTIONS = arrayOf("文件导入", "网络地址导入", "粘贴 JSON 导入")
+        private val EXPORT_FORMAT_OPTIONS = arrayOf(
+            ExportFormatOption("OpenAPI 3.0 (JSON)", "openapi"),
+            ExportFormatOption("Swagger 2.0 (JSON)", "swagger"),
+            ExportFormatOption("HTML 文档", "html"),
+            ExportFormatOption("PDF 文档", "pdf")
         )
         private val PRE_SCRIPT_SNIPPETS = listOf(
             ScriptSnippet("读取环境变量", "var token = env.get(\"token\");\nif (token) {\n  request.headers.Authorization = \"Bearer \" + token;\n}"),

@@ -65,6 +65,11 @@ object HttpPluginContext {
         SwingUtilities.invokeLater { action.run() }
     }
 
+    fun refreshApiData(project: Project) {
+        val panel = states[project]?.panel ?: return
+        SwingUtilities.invokeLater { panel.reloadApiDataFromStorage() }
+    }
+
     fun updateSettings(project: Project, settings: HttpUiSettings) {
         HttpUiSettingsStore.save(project, settings)
         val sanitized = HttpUiSettingsStore.load(project)
