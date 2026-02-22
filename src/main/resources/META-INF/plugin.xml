@@ -1,7 +1,7 @@
-<idea-plugin require-restart="true">
+<idea-plugin require-restart="false">
     <id>com.lhstack.https</id>
     <name>JTools HTTP Client</name>
-    <version>0.0.3</version>
+    <version>0.0.4</version>
     <vendor>lhstack</vendor>
 
     <description><![CDATA[
@@ -26,6 +26,21 @@
     ]]></description>
 
     <change-notes><![CDATA[
+    <p><b>v0.0.4</b></p>
+    <ul>
+        <li>中文：新增接口变量能力，支持在请求页维护变量，并可通过 {{name}} / {{api.name}} / {{project.name}} / {{global.name}} / {{env.name}} / {{path.id}} 进行模板替换。</li>
+        <li>中文：新增变量匹配可视化，URL 与 value 列支持匹配状态高亮和悬浮提示，显示变量来源、解析值与未匹配原因。</li>
+        <li>中文：增强 URL 路径占位符解析，支持 {id} 与路径变量联动匹配，并修复首次加载时匹配状态延迟刷新的问题。</li>
+        <li>中文：请求工具栏新增“环境变量”入口，可直接维护项目/全局环境变量，无需切换到脚本页。</li>
+        <li>中文：接口文档增强，请求文档新增“路径变量说明”和“查询参数说明”卡片，自动汇总对应页签中的字段说明与示例值。</li>
+        <li>中文：草稿持久化优化，编辑请求参数后自动保存当前 Tab，避免重新打开后值回退。</li>
+        <li>English: Added request-level variables with template substitution via {{name}} / {{api.name}} / {{project.name}} / {{global.name}} / {{env.name}} / {{path.id}}.</li>
+        <li>English: Added variable match visualization: URL and value cells now show match-state highlighting and tooltips with source/value/unresolved reason.</li>
+        <li>English: Improved URL path placeholder handling so {id} resolves against path variables, and fixed delayed refresh on first tab load.</li>
+        <li>English: Added an Environment Variables action to the request toolbar, so project/global env values can be edited without switching to script tabs.</li>
+        <li>English: Enhanced API docs with request-side cards for Path Variable Docs and Query Parameter Docs, auto-summarized from corresponding tabs.</li>
+        <li>English: Improved draft persistence by auto-saving current tab changes after edits to prevent value rollback after reopening.</li>
+    </ul>
     <p><b>v0.0.3</b></p>
     <ul>
         <li>中文：新增前置/后置脚本能力，可在发送前后动态处理 URL、参数、Header、Cookie 与响应数据。</li>

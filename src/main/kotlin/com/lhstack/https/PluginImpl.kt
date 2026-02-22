@@ -46,7 +46,7 @@ class PluginImpl : IPlugin {
     }
 
     override fun pluginVersion(): String {
-        return "v0.0.3"
+        return "v0.0.4"
     }
 
     override fun openProject(project: Project?, logger: Logger?, openThisPage: Runnable?) {

@@ -61,6 +61,7 @@ object HttpApiDocumentExportService {
         serverUrl: String
     ): Map<String, Any?> {
         val paths = linkedMapOf<String, MutableMap<String, Any?>>()
+        val securitySchemes = linkedMapOf<String, Any?>()
         requests.forEach { request ->
             val draft = request.draft
             val path = normalizeDocPath(draft.path.ifBlank { extractDocPath(draft.url) })
@@ -117,6 +118,10 @@ object HttpApiDocumentExportService {
             if (requestBody != null) {
                 operation["requestBody"] = requestBody
             }
+            val operationSecurity = collectOpenApiSecurity(draft, securitySchemes)
+            if (operationSecurity.isNotEmpty()) {
+                operation["security"] = operationSecurity
+            }
             val pathItem = paths.getOrPut(path) { linkedMapOf() }
             pathItem[method] = operation
         }
@@ -125,6 +130,9 @@ object HttpApiDocumentExportService {
             "info" to mapOf("title" to title, "version" to version),
             "paths" to paths
         )
+        if (securitySchemes.isNotEmpty()) {
+            root["components"] = mapOf("securitySchemes" to securitySchemes)
+        }
         if (serverUrl.isNotBlank()) {
             root["servers"] = listOf(mapOf("url" to serverUrl))
         }
@@ -214,6 +222,7 @@ object HttpApiDocumentExportService {
         serverUrl: String
     ): Map<String, Any?> {
         val paths = linkedMapOf<String, MutableMap<String, Any?>>()
+        val securityDefinitions = linkedMapOf<String, Any?>()
         requests.forEach { request ->
             val draft = request.draft
             val path = normalizeDocPath(draft.path.ifBlank { extractDocPath(draft.url) })
@@ -326,6 +335,10 @@ object HttpApiDocumentExportService {
             if (parameters.isNotEmpty()) {
                 operation["parameters"] = parameters
             }
+            val operationSecurity = collectSwaggerSecurity(draft, securityDefinitions)
+            if (operationSecurity.isNotEmpty()) {
+                operation["security"] = operationSecurity
+            }
             val pathItem = paths.getOrPut(path) { linkedMapOf() }
             pathItem[method] = operation
         }
@@ -334,6 +347,9 @@ object HttpApiDocumentExportService {
             "info" to mapOf("title" to title, "version" to version),
             "paths" to paths
         )
+        if (securityDefinitions.isNotEmpty()) {
+            root["securityDefinitions"] = securityDefinitions
+        }
         if (serverUrl.isNotBlank()) {
             root["x-server-url"] = serverUrl
         }
@@ -519,6 +535,184 @@ object HttpApiDocumentExportService {
             return null
         }
         return root
+    }
+
+    private fun collectOpenApiSecurity(
+        draft: HttpRequestDraft,
+        securitySchemes: MutableMap<String, Any?>
+    ): List<Map<String, Any?>> {
+        val requirements = mutableListOf<Map<String, Any?>>()
+        val seen = linkedSetOf<String>()
+        val authHeader = draft.headers.firstOrNull { it.key.equals("Authorization", ignoreCase = true) }
+        if (authHeader != null) {
+            val authValue = authHeader.value.trim()
+            if (authValue.startsWith("Basic ", ignoreCase = true)) {
+                val schemeName = "basicAuth"
+                securitySchemes.putIfAbsent(schemeName, mapOf("type" to "http", "scheme" to "basic"))
+                addSecurityRequirement(requirements, seen, schemeName)
+            } else {
+                val schemeName = "bearerAuth"
+                securitySchemes.putIfAbsent(
+                    schemeName,
+                    mapOf("type" to "http", "scheme" to "bearer", "bearerFormat" to "JWT")
+                )
+                addSecurityRequirement(requirements, seen, schemeName)
+            }
+        }
+        draft.headers.forEach { header ->
+            val key = header.key.trim()
+            if (key.isBlank() || key.equals("Authorization", ignoreCase = true) || key.equals("Cookie", ignoreCase = true)) {
+                return@forEach
+            }
+            if (!looksLikeAuthKey(key)) {
+                return@forEach
+            }
+            val schemeName = "apiKeyHeader_${sanitizeSecurityName(key)}"
+            securitySchemes.putIfAbsent(
+                schemeName,
+                mapOf("type" to "apiKey", "in" to "header", "name" to key)
+            )
+            addSecurityRequirement(requirements, seen, schemeName)
+        }
+        draft.params.forEach { param ->
+            val key = param.key.trim()
+            if (key.isBlank() || !looksLikeAuthKey(key)) {
+                return@forEach
+            }
+            val schemeName = "apiKeyQuery_${sanitizeSecurityName(key)}"
+            securitySchemes.putIfAbsent(
+                schemeName,
+                mapOf("type" to "apiKey", "in" to "query", "name" to key)
+            )
+            addSecurityRequirement(requirements, seen, schemeName)
+        }
+        val cookieHeader = draft.headers.firstOrNull { it.key.equals("Cookie", ignoreCase = true) }
+        if (cookieHeader != null) {
+            parseCookieNames(cookieHeader.value).forEach { cookieName ->
+                if (!looksLikeAuthKey(cookieName)) {
+                    return@forEach
+                }
+                val schemeName = "apiKeyCookie_${sanitizeSecurityName(cookieName)}"
+                securitySchemes.putIfAbsent(
+                    schemeName,
+                    mapOf("type" to "apiKey", "in" to "cookie", "name" to cookieName)
+                )
+                addSecurityRequirement(requirements, seen, schemeName)
+            }
+        }
+        return requirements
+    }
+
+    private fun collectSwaggerSecurity(
+        draft: HttpRequestDraft,
+        securityDefinitions: MutableMap<String, Any?>
+    ): List<Map<String, Any?>> {
+        val requirements = mutableListOf<Map<String, Any?>>()
+        val seen = linkedSetOf<String>()
+        val authHeader = draft.headers.firstOrNull { it.key.equals("Authorization", ignoreCase = true) }
+        if (authHeader != null) {
+            val authValue = authHeader.value.trim()
+            if (authValue.startsWith("Basic ", ignoreCase = true)) {
+                val schemeName = "basicAuth"
+                securityDefinitions.putIfAbsent(schemeName, mapOf("type" to "basic"))
+                addSecurityRequirement(requirements, seen, schemeName)
+            } else {
+                val schemeName = "bearerAuth"
+                securityDefinitions.putIfAbsent(
+                    schemeName,
+                    mapOf("type" to "apiKey", "in" to "header", "name" to "Authorization")
+                )
+                addSecurityRequirement(requirements, seen, schemeName)
+            }
+        }
+        draft.headers.forEach { header ->
+            val key = header.key.trim()
+            if (key.isBlank() || key.equals("Authorization", ignoreCase = true) || key.equals("Cookie", ignoreCase = true)) {
+                return@forEach
+            }
+            if (!looksLikeAuthKey(key)) {
+                return@forEach
+            }
+            val schemeName = "apiKeyHeader_${sanitizeSecurityName(key)}"
+            securityDefinitions.putIfAbsent(
+                schemeName,
+                mapOf("type" to "apiKey", "in" to "header", "name" to key)
+            )
+            addSecurityRequirement(requirements, seen, schemeName)
+        }
+        draft.params.forEach { param ->
+            val key = param.key.trim()
+            if (key.isBlank() || !looksLikeAuthKey(key)) {
+                return@forEach
+            }
+            val schemeName = "apiKeyQuery_${sanitizeSecurityName(key)}"
+            securityDefinitions.putIfAbsent(
+                schemeName,
+                mapOf("type" to "apiKey", "in" to "query", "name" to key)
+            )
+            addSecurityRequirement(requirements, seen, schemeName)
+        }
+        val cookieHeader = draft.headers.firstOrNull { it.key.equals("Cookie", ignoreCase = true) }
+        if (cookieHeader != null) {
+            parseCookieNames(cookieHeader.value).forEach { cookieName ->
+                if (!looksLikeAuthKey(cookieName)) {
+                    return@forEach
+                }
+                val schemeName = "apiKeyCookie_${sanitizeSecurityName(cookieName)}"
+                securityDefinitions.putIfAbsent(
+                    schemeName,
+                    mapOf("type" to "apiKey", "in" to "header", "name" to "Cookie")
+                )
+                addSecurityRequirement(requirements, seen, schemeName)
+            }
+        }
+        return requirements
+    }
+
+    private fun addSecurityRequirement(
+        target: MutableList<Map<String, Any?>>,
+        seen: MutableSet<String>,
+        schemeName: String
+    ) {
+        if (!seen.add(schemeName)) {
+            return
+        }
+        target.add(mapOf(schemeName to emptyList<String>()))
+    }
+
+    private fun sanitizeSecurityName(raw: String): String {
+        return raw.trim()
+            .replace(Regex("[^A-Za-z0-9]+"), "_")
+            .trim('_')
+            .ifBlank { "key" }
+    }
+
+    private fun looksLikeAuthKey(raw: String): Boolean {
+        val key = raw.trim().lowercase()
+        if (key.isBlank()) {
+            return false
+        }
+        return key.contains("token") ||
+            key.contains("api-key") ||
+            key.contains("apikey") ||
+            key.contains("access-key") ||
+            key.contains("accesskey") ||
+            key.contains("appkey") ||
+            key.contains("secret") ||
+            key.contains("signature") ||
+            key.startsWith("x-auth") ||
+            key.startsWith("auth-")
+    }
+
+    private fun parseCookieNames(cookieHeader: String): List<String> {
+        if (cookieHeader.isBlank()) {
+            return emptyList()
+        }
+        return cookieHeader.split(";")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .map { it.substringBefore("=").trim() }
+            .filter { it.isNotBlank() }
     }
 
     private fun normalizeResponseStatusDocs(draft: HttpRequestDraft): List<HttpKeyValue> {

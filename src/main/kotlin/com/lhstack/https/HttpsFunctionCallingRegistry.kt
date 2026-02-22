@@ -69,6 +69,7 @@ class HttpsFunctionCallingRegistry(
                         "method":{"type":"string","description":"HTTP 方法：GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS"},
                         "url":{"type":"string"},
                         "timeoutSeconds":{"type":"integer"},
+                        "requestVars":{"type":"object","additionalProperties":{"type":"string"}},
                         "pathParams":{"type":"object","additionalProperties":{"type":"string"}},
                         "params":{"type":"object","additionalProperties":{"type":"string"}},
                         "headers":{"type":"object","additionalProperties":{"type":"string"}},
@@ -94,6 +95,7 @@ class HttpsFunctionCallingRegistry(
                     method = method,
                     url = url,
                     timeoutSeconds = timeout,
+                    requestVars = toKeyValueList(args["requestVars"]),
                     pathParams = toKeyValueList(args["pathParams"]),
                     params = toKeyValueList(args["params"]),
                     headers = toKeyValueList(args["headers"]),
@@ -145,23 +147,64 @@ class HttpsFunctionCallingRegistry(
                 mapOf("total" to items.size, "items" to items)
             },
             buildFunction(
-                name = "https_get_saved_request_detail",
-                description = "按 id 获取已保存接口详情（包含完整请求草稿）。",
+                name = "https_get_request_codegen_context",
+                description = "获取接口详细上下文，便于大模型生成调用代码。支持按 savedRequestId / sourceTabId / method+url 定位。",
                 parameters = """
                     {
                       "type":"object",
-                      "required":["id"],
                       "properties":{
-                        "id":{"type":"integer"}
+                        "savedRequestId":{"type":"integer","description":"已保存接口 id，优先级最高"},
+                        "sourceTabId":{"type":"integer","description":"请求标签页 id（当 savedRequestId 未传时生效）"},
+                        "method":{"type":"string","description":"按 method + url 定位时可选，默认 GET"},
+                        "url":{"type":"string","description":"按 method + url 定位时必填"},
+                        "includeHistory":{"type":"boolean","description":"是否返回最近一次历史响应，默认 true"},
+                        "includeEndpointSource":{"type":"boolean","description":"是否返回项目中的端点定位信息，默认 true"}
                       }
                     }
                 """.trimIndent()
             ) { args ->
-                val id = args["id"].asLongOrNull()
-                    ?: throw IllegalArgumentException("id is required")
-                val request = HttpApiStorage.loadRequests(project).firstOrNull { it.id == id }
-                    ?: throw IllegalArgumentException("saved request not found: $id")
-                savedRequestToMap(request)
+                val includeHistory = args["includeHistory"].asBooleanOrNull() ?: true
+                val includeEndpointSource = args["includeEndpointSource"].asBooleanOrNull() ?: true
+                val target = resolveCodegenTarget(args)
+                val resolvedDraft = resolveDraftForRequest(cloneDraft(target.draft))
+                val normalizedMethod = resolvedDraft.method.trim().uppercase().ifBlank { "GET" }
+                val resolvedPath = resolvedDraft.path.ifBlank { extractDocPath(resolvedDraft.url) }
+                val result = linkedMapOf<String, Any?>(
+                    "source" to linkedMapOf(
+                        "type" to target.sourceType,
+                        "matchedBy" to target.matchedBy,
+                        "savedRequestId" to target.savedRequest?.id,
+                        "sourceTabId" to target.sourceTab?.id,
+                        "name" to (target.savedRequest?.name ?: target.sourceTab?.title),
+                        "groupId" to target.savedRequest?.groupId,
+                        "groupPath" to resolveGroupPath(target.savedRequest?.groupId)
+                    ),
+                    "request" to draftToMap(resolvedDraft),
+                    "documentation" to linkedMapOf(
+                        "requestBodyFields" to keyValueListToMapWithDescription(resolvedDraft.requestBodyParams),
+                        "responseStatus" to resolvedDraft.responseStatus,
+                        "responseContentType" to resolvedDraft.responseContentType,
+                        "responseDescription" to resolvedDraft.responseDescription,
+                        "responseStatusDocs" to keyValueListToMapWithDescription(
+                            resolvedDraft.responseStatusDocs.map { it.copy(description = it.description.ifBlank { it.value }) }
+                        ),
+                        "responseFields" to keyValueListToMapWithDescription(resolvedDraft.responseParams),
+                        "responseExample" to resolvedDraft.responseBody
+                    ),
+                    "resolved" to mapOf(
+                        "method" to normalizedMethod,
+                        "url" to resolvedDraft.url,
+                        "path" to resolvedPath
+                    ),
+                    "curl" to buildCurlCommand(resolvedDraft)
+                )
+                if (includeHistory) {
+                    result["latestHistory"] = loadLatestHistoryForCodegen(target)
+                }
+                if (includeEndpointSource) {
+                    result["projectEndpoints"] = findProjectEndpointsForCodegen(normalizedMethod, resolvedDraft.url, resolvedPath)
+                }
+                result
             },
             buildFunction(
                 name = "https_save_request",
@@ -181,6 +224,7 @@ class HttpsFunctionCallingRegistry(
                             "method":{"type":"string"},
                             "url":{"type":"string"},
                             "timeoutSeconds":{"type":"integer"},
+                            "requestVars":{"type":"object","additionalProperties":{"type":"string"}},
                             "pathParams":{"type":"object","additionalProperties":{"type":"string"}},
                             "params":{"type":"object","additionalProperties":{"type":"string"}},
                             "headers":{"type":"object","additionalProperties":{"type":"string"}},
@@ -251,6 +295,7 @@ class HttpsFunctionCallingRegistry(
                             "method":{"type":"string"},
                             "url":{"type":"string"},
                             "timeoutSeconds":{"type":"integer"},
+                            "requestVars":{"type":"object","additionalProperties":{"type":"string"}},
                             "pathParams":{"type":"object","additionalProperties":{"type":"string"}},
                             "params":{"type":"object","additionalProperties":{"type":"string"}},
                             "headers":{"type":"object","additionalProperties":{"type":"string"}},
@@ -572,6 +617,7 @@ class HttpsFunctionCallingRegistry(
                             "method":{"type":"string"},
                             "url":{"type":"string"},
                             "timeoutSeconds":{"type":"integer"},
+                            "requestVars":{"type":"object","additionalProperties":{"type":"string"}},
                             "pathParams":{"type":"object","additionalProperties":{"type":"string"}},
                             "params":{"type":"object","additionalProperties":{"type":"string"}},
                             "headers":{"type":"object","additionalProperties":{"type":"string"}},
@@ -608,6 +654,7 @@ class HttpsFunctionCallingRegistry(
                             "method":{"type":"string"},
                             "url":{"type":"string"},
                             "timeoutSeconds":{"type":"integer"},
+                            "requestVars":{"type":"object","additionalProperties":{"type":"string"}},
                             "pathParams":{"type":"object","additionalProperties":{"type":"string"}},
                             "params":{"type":"object","additionalProperties":{"type":"string"}},
                             "headers":{"type":"object","additionalProperties":{"type":"string"}},
@@ -1009,6 +1056,7 @@ class HttpsFunctionCallingRegistry(
                 """.trimIndent()
             ) {
                 val settings = HttpUiSettingsStore.load(project)
+                val templateSettings = HttpVariableTemplateSettingsStore.load(project)
                 mapOf(
                     "defaultTimeoutSeconds" to settings.defaultTimeoutSeconds,
                     "maxRawViewChars" to settings.maxRawViewChars,
@@ -1020,7 +1068,10 @@ class HttpsFunctionCallingRegistry(
                     "proxyHost" to settings.proxyHost,
                     "proxyPort" to settings.proxyPort,
                     "proxyUsername" to settings.proxyUsername,
-                    "proxyPasswordConfigured" to settings.proxyPassword.isNotEmpty()
+                    "proxyPasswordConfigured" to settings.proxyPassword.isNotEmpty(),
+                    "templateEnabled" to templateSettings.templateEnabled,
+                    "templateUnresolvedPolicy" to templateSettings.unresolvedPolicyEnum().name,
+                    "templateResolveOrder" to templateSettings.resolveOrderEnum().name
                 )
             },
             buildFunction(
@@ -1040,12 +1091,16 @@ class HttpsFunctionCallingRegistry(
                         "proxyHost":{"type":"string","description":"代理地址"},
                         "proxyPort":{"type":"integer","description":"代理端口，1-65535"},
                         "proxyUsername":{"type":"string","description":"代理用户名，可选"},
-                        "proxyPassword":{"type":"string","description":"代理密码，可选；传空字符串可清空"}
+                        "proxyPassword":{"type":"string","description":"代理密码，可选；传空字符串可清空"},
+                        "templateEnabled":{"type":"boolean","description":"是否启用模板变量替换"},
+                        "templateUnresolvedPolicy":{"type":"string","description":"未解析变量处理：KEEP/ERROR"},
+                        "templateResolveOrder":{"type":"string","description":"未加命名空间变量解析优先级：REQUEST_PROJECT_GLOBAL/PROJECT_GLOBAL_REQUEST"}
                       }
                     }
                 """.trimIndent()
             ) { args ->
                 val current = HttpUiSettingsStore.load(project)
+                val currentTemplate = HttpVariableTemplateSettingsStore.load(project)
                 val updated = current.copy(
                     defaultTimeoutSeconds = args["defaultTimeoutSeconds"].asIntOrNull() ?: current.defaultTimeoutSeconds,
                     maxRawViewChars = args["maxRawViewChars"].asIntOrNull() ?: current.maxRawViewChars,
@@ -1059,8 +1114,21 @@ class HttpsFunctionCallingRegistry(
                     proxyUsername = args["proxyUsername"]?.toString() ?: current.proxyUsername,
                     proxyPassword = args["proxyPassword"]?.toString() ?: current.proxyPassword
                 )
+                val updatedTemplate = HttpVariableTemplateSettings(
+                    templateEnabled = args["templateEnabled"].asBooleanOrNull() ?: currentTemplate.templateEnabled,
+                    unresolvedPolicy = parseTemplateUnresolvedPolicy(
+                        args["templateUnresolvedPolicy"]?.toString(),
+                        currentTemplate.unresolvedPolicyEnum()
+                    ).name,
+                    unscopedResolveOrder = parseTemplateResolveOrder(
+                        args["templateResolveOrder"]?.toString(),
+                        currentTemplate.resolveOrderEnum()
+                    ).name
+                )
                 HttpPluginContext.updateSettings(project, updated)
+                HttpPluginContext.updateVariableTemplateSettings(project, updatedTemplate)
                 val reloaded = HttpUiSettingsStore.load(project)
+                val reloadedTemplate = HttpVariableTemplateSettingsStore.load(project)
                 mapOf(
                     "defaultTimeoutSeconds" to reloaded.defaultTimeoutSeconds,
                     "maxRawViewChars" to reloaded.maxRawViewChars,
@@ -1072,7 +1140,10 @@ class HttpsFunctionCallingRegistry(
                     "proxyHost" to reloaded.proxyHost,
                     "proxyPort" to reloaded.proxyPort,
                     "proxyUsername" to reloaded.proxyUsername,
-                    "proxyPasswordConfigured" to reloaded.proxyPassword.isNotEmpty()
+                    "proxyPasswordConfigured" to reloaded.proxyPassword.isNotEmpty(),
+                    "templateEnabled" to reloadedTemplate.templateEnabled,
+                    "templateUnresolvedPolicy" to reloadedTemplate.unresolvedPolicyEnum().name,
+                    "templateResolveOrder" to reloadedTemplate.resolveOrderEnum().name
                 )
             },
             buildFunction(
@@ -1276,6 +1347,9 @@ class HttpsFunctionCallingRegistry(
 
     private fun applyDraftPatch(base: HttpRequestDraft, patch: Map<String, Any?>): HttpRequestDraft {
         val next = cloneDraft(base)
+        if (patch.containsKey("requestVars")) {
+            next.requestVars = toKeyValueList(patch["requestVars"])
+        }
         if (patch.containsKey("method")) {
             val method = patch["method"]?.toString()?.trim()?.uppercase().orEmpty()
             if (method.isNotBlank()) {
@@ -1365,6 +1439,7 @@ class HttpsFunctionCallingRegistry(
 
     private fun cloneDraft(draft: HttpRequestDraft): HttpRequestDraft {
         return draft.copy(
+            requestVars = draft.requestVars.map { it.copy() }.toMutableList(),
             pathParams = draft.pathParams.map { it.copy() }.toMutableList(),
             params = draft.params.map { it.copy() }.toMutableList(),
             headers = draft.headers.map { it.copy() }.toMutableList(),
@@ -1445,11 +1520,160 @@ class HttpsFunctionCallingRegistry(
         )
     }
 
+    private fun resolveCodegenTarget(args: Map<String, Any?>): CodegenTarget {
+        val savedRequestId = args["savedRequestId"].asLongOrNull()
+        val sourceTabId = args["sourceTabId"].asLongOrNull()
+        val method = args["method"]?.toString()?.trim()
+        val url = args["url"]?.toString()?.trim().orEmpty()
+        if (savedRequestId != null) {
+            val saved = HttpApiStorage.loadRequests(project).firstOrNull { it.id == savedRequestId }
+                ?: throw IllegalArgumentException("saved request not found: $savedRequestId")
+            return CodegenTarget(
+                sourceType = "SAVED",
+                matchedBy = "savedRequestId",
+                savedRequest = saved,
+                sourceTab = null,
+                draft = cloneDraft(saved.draft)
+            )
+        }
+        if (sourceTabId != null) {
+            val tab = HttpCallTabStorage.loadTabs(project).firstOrNull { it.id == sourceTabId }
+                ?: throw IllegalArgumentException("tab not found: $sourceTabId")
+            val linkedSaved = tab.savedRequestId?.let { id ->
+                HttpApiStorage.loadRequests(project).firstOrNull { it.id == id }
+            }
+            return CodegenTarget(
+                sourceType = "TAB",
+                matchedBy = "sourceTabId",
+                savedRequest = linkedSaved,
+                sourceTab = tab,
+                draft = cloneDraft(tab.draft)
+            )
+        }
+        if (url.isNotBlank()) {
+            val found = findSavedRequestByMethodAndUrl(method, url)
+                ?: throw IllegalArgumentException("no saved request matched by method+url: ${method.orEmpty()} $url")
+            return CodegenTarget(
+                sourceType = "SAVED",
+                matchedBy = "method+url",
+                savedRequest = found,
+                sourceTab = null,
+                draft = cloneDraft(found.draft)
+            )
+        }
+        throw IllegalArgumentException("savedRequestId or sourceTabId or url is required")
+    }
+
+    private fun findSavedRequestByMethodAndUrl(method: String?, url: String): HttpSavedRequest? {
+        val requests = HttpApiStorage.loadRequests(project)
+        if (requests.isEmpty()) {
+            return null
+        }
+        val normalizedMethod = method?.trim()?.uppercase().orEmpty().ifBlank { null }
+        val targetPath = parseRequestPath(url) ?: extractDocPath(url)
+        val exact = requests.firstOrNull { request ->
+            val reqMethod = request.draft.method.trim().uppercase().ifBlank { "GET" }
+            if (normalizedMethod != null && reqMethod != normalizedMethod) {
+                return@firstOrNull false
+            }
+            resolveRequestPath(request.draft) == targetPath
+        }
+        if (exact != null) {
+            return exact
+        }
+        val fallback = requests.firstOrNull { request ->
+            val reqMethod = request.draft.method.trim().uppercase().ifBlank { "GET" }
+            if (normalizedMethod != null && reqMethod != normalizedMethod) {
+                return@firstOrNull false
+            }
+            containsIgnoreCase(request.draft.url, url) || containsIgnoreCase(request.name, url)
+        }
+        return fallback
+    }
+
+    private fun resolveRequestPath(draft: HttpRequestDraft): String {
+        val byDraft = draft.path.trim().ifBlank { "/" }
+        if (byDraft != "/") {
+            return byDraft.substringBefore('?')
+        }
+        return parseRequestPath(draft.url) ?: extractDocPath(draft.url)
+    }
+
+    private fun resolveGroupPath(groupId: Long?): String? {
+        if (groupId == null) {
+            return null
+        }
+        val groups = HttpApiStorage.loadGroups(project)
+        if (groups.isEmpty()) {
+            return null
+        }
+        val byId = groups.associateBy { it.id }
+        val path = mutableListOf<String>()
+        var current = byId[groupId]
+        while (current != null) {
+            path.add(current.name)
+            val parentId = current.parentId ?: break
+            current = byId[parentId]
+        }
+        if (path.isEmpty()) {
+            return null
+        }
+        return path.asReversed().joinToString(" / ")
+    }
+
+    private fun loadLatestHistoryForCodegen(target: CodegenTarget): Map<String, Any?>? {
+        val saved = target.savedRequest
+        if (saved != null) {
+            val latestSaved = HttpRequestHistoryStorage.loadForSource(project, HistorySourceType.SAVED, saved.id).firstOrNull()
+            if (latestSaved != null) {
+                return mapOf(
+                    "sourceType" to latestSaved.sourceType.name,
+                    "sourceId" to latestSaved.sourceId,
+                    "createdAt" to latestSaved.createdAt.toString(),
+                    "request" to draftToMap(latestSaved.request),
+                    "response" to responseToMap(latestSaved.response)
+                )
+            }
+        }
+        val tab = target.sourceTab
+        if (tab != null) {
+            val latestTab = HttpRequestHistoryStorage.loadForSource(project, HistorySourceType.TAB, tab.id).firstOrNull()
+            if (latestTab != null) {
+                return mapOf(
+                    "sourceType" to latestTab.sourceType.name,
+                    "sourceId" to latestTab.sourceId,
+                    "createdAt" to latestTab.createdAt.toString(),
+                    "request" to draftToMap(latestTab.request),
+                    "response" to responseToMap(latestTab.response)
+                )
+            }
+        }
+        return null
+    }
+
+    private fun findProjectEndpointsForCodegen(method: String, url: String, path: String): List<Map<String, Any?>> {
+        val requestPath = parseRequestPath(url) ?: parseRequestPath(path) ?: return emptyList()
+        val endpoints = ReadAction.compute<List<EndpointInfo>, RuntimeException> {
+            HttpEndpointLocator.find(project, method, requestPath)
+        }
+        return endpoints.map { endpoint ->
+            mapOf(
+                "method" to endpoint.httpMethod,
+                "path" to endpoint.path,
+                "source" to endpoint.source.name,
+                "className" to endpoint.psiMethod?.containingClass?.qualifiedName,
+                "methodName" to endpoint.psiMethod?.name,
+                "filePath" to endpoint.anchor.containingFile?.virtualFile?.path
+            )
+        }
+    }
+
     private fun draftToMap(draft: HttpRequestDraft): Map<String, Any?> {
         return mapOf(
             "method" to draft.method,
             "url" to draft.url,
             "timeoutSeconds" to draft.timeoutSeconds,
+            "requestVars" to keyValueListToMapWithDescription(draft.requestVars),
             "pathParams" to keyValueListToMap(draft.pathParams),
             "params" to keyValueListToMap(draft.params),
             "headers" to keyValueListToMap(draft.headers),
@@ -1585,17 +1809,18 @@ class HttpsFunctionCallingRegistry(
     }
 
     private fun resolveDraftForRequest(draft: HttpRequestDraft): HttpRequestDraft {
-        val normalizedUrl = normalizeUrl(draft.url)
+        val templated = HttpVariableTemplateResolver.resolveDraft(project, draft)
+        val normalizedUrl = normalizeUrl(templated.url)
         val parts = parseUrl(normalizedUrl)
-        val mergedParams = mergeParams(parts.queryParams, draft.params)
-        val resolvedPath = applyPathVariables(parts.path, draft.pathParams)
+        val mergedParams = mergeParams(parts.queryParams, templated.params)
+        val resolvedPath = applyPathVariables(parts.path, templated.pathParams)
         val baseUrl = replacePathInBaseUrl(parts.baseUrl, parts.path, resolvedPath)
         val finalUrl = buildUrl(baseUrl, mergedParams)
-        return draft.copy(
+        return templated.copy(
             url = finalUrl,
             path = resolvedPath,
             params = mergedParams,
-            timeoutSeconds = draft.timeoutSeconds.coerceIn(1, MAX_TIMEOUT_SECONDS)
+            timeoutSeconds = templated.timeoutSeconds.coerceIn(1, MAX_TIMEOUT_SECONDS)
         )
     }
 
@@ -1668,6 +1893,30 @@ class HttpsFunctionCallingRegistry(
 
     private fun normalizeProxyType(value: String?): String {
         return if (value?.trim()?.equals("SOCKS", ignoreCase = true) == true) "SOCKS" else "HTTP"
+    }
+
+    private fun parseTemplateUnresolvedPolicy(
+        value: String?,
+        fallback: HttpVariableTemplateSettings.UnresolvedPolicy
+    ): HttpVariableTemplateSettings.UnresolvedPolicy {
+        val normalized = value?.trim()?.uppercase().orEmpty()
+        return when (normalized) {
+            HttpVariableTemplateSettings.UnresolvedPolicy.ERROR.name -> HttpVariableTemplateSettings.UnresolvedPolicy.ERROR
+            HttpVariableTemplateSettings.UnresolvedPolicy.KEEP.name -> HttpVariableTemplateSettings.UnresolvedPolicy.KEEP
+            else -> fallback
+        }
+    }
+
+    private fun parseTemplateResolveOrder(
+        value: String?,
+        fallback: HttpVariableTemplateSettings.ResolveOrder
+    ): HttpVariableTemplateSettings.ResolveOrder {
+        val normalized = value?.trim()?.uppercase().orEmpty()
+        return when (normalized) {
+            HttpVariableTemplateSettings.ResolveOrder.PROJECT_GLOBAL_REQUEST.name -> HttpVariableTemplateSettings.ResolveOrder.PROJECT_GLOBAL_REQUEST
+            HttpVariableTemplateSettings.ResolveOrder.REQUEST_PROJECT_GLOBAL.name -> HttpVariableTemplateSettings.ResolveOrder.REQUEST_PROJECT_GLOBAL
+            else -> fallback
+        }
     }
 
     private fun applyDefaultHeaders(headers: MutableList<HttpKeyValue>) {
@@ -3065,6 +3314,14 @@ class HttpsFunctionCallingRegistry(
         val sourceId: Long?
     )
 
+    private data class CodegenTarget(
+        val sourceType: String,
+        val matchedBy: String,
+        val savedRequest: HttpSavedRequest?,
+        val sourceTab: HttpCallTab?,
+        val draft: HttpRequestDraft
+    )
+
     private data class UrlParts(
         val baseUrl: String,
         val path: String,
@@ -3117,6 +3374,7 @@ class HttpsFunctionCallingRegistry(
             "C:\\Windows\\Fonts\\simhei.ttf"
         )
         private val DRAFT_KEYS = setOf(
+            "requestVars",
             "method",
             "url",
             "timeoutSeconds",

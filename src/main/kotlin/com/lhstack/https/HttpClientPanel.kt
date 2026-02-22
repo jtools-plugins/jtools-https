@@ -111,6 +111,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     )
 
     private var uiSettings = HttpUiSettingsStore.load(project)
+    private var variableTemplateSettings = normalizeVariableTemplateSettings(HttpVariableTemplateSettingsStore.load(project))
 
     private val methodBox = JComboBox(HTTP_METHODS)
     private val urlField = JBTextField()
@@ -161,7 +162,11 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val requestHistoryAction = simpleAction("历史", "查看当前请求历史", HttpIcons.historyRequest) {
         showCurrentRequestHistory()
     }
+    private val envSettingsAction = simpleAction("环境变量", "配置项目/全局环境变量", HttpIcons.scriptEnv) {
+        ScriptEnvDialog(project).show()
+    }
 
+    private val requestVarsModel = DefaultTableModel(arrayOf("键", "值", "说明"), 0)
     private val pathParamsModel = DefaultTableModel(arrayOf("键", "值", "说明"), 0)
     private val paramsModel = DefaultTableModel(arrayOf("键", "值", "说明"), 0)
     private val headersModel = DefaultTableModel(arrayOf("键", "值", "说明"), 0)
@@ -241,13 +246,24 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private var renderInFlightVersion = -1
     private var nextTempTabId = -1L
     private val pendingTabInserts = mutableSetOf<Long>()
+    private var committingEditors = false
+    private var persistingCurrentTab = false
+    private var draftPersistTimer: javax.swing.Timer? = null
     private val jsonMapper = ObjectMapper()
     private var syncingDocEditors = false
+    private var docPreviewRefreshScheduled = false
+    private var templateDecorationsRefreshScheduled = false
+    private var templatePreviewContext: TemplatePreviewContext? = null
+    private val templateAwareTables = mutableListOf<JBTable>()
+    private val tableByModel = IdentityHashMap<DefaultTableModel, JTable>()
+    private val defaultUrlFieldForeground: Color = urlField.foreground
+    private val defaultUrlFieldBackground: Color = urlField.background
 
     init {
         border = JBUI.Borders.empty(8)
         buildHistoryPanel()
         setupDocPreviewListeners()
+        setupDraftPersistenceListeners()
         loadApiData()
         loadCallTabs()
         loadCookies()
@@ -255,11 +271,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun setupDocPreviewListeners() {
         val refresh = {
-            if (!isLoading) {
-                refreshRequestDocExampleFromUi()
-            }
+            scheduleRequestDocPreviewRefresh()
         }
-        listOf(pathParamsModel, paramsModel, headersModel, urlEncodedModel, formDataModel, requestDocParamsModel)
+        listOf(urlEncodedModel, formDataModel, requestDocParamsModel)
             .forEach { model ->
                 model.addTableModelListener { refresh() }
             }
@@ -285,8 +299,146 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         bodyTypeBox.addActionListener { refresh() }
     }
 
+    private fun scheduleRequestDocPreviewRefresh() {
+        if (docPreviewRefreshScheduled) {
+            return
+        }
+        docPreviewRefreshScheduled = true
+        SwingUtilities.invokeLater {
+            docPreviewRefreshScheduled = false
+            if (isLoading || committingEditors || syncingDocEditors) {
+                return@invokeLater
+            }
+            val focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner
+            val focusedTable = SwingUtilities.getAncestorOfClass(JTable::class.java, focusOwner) as? JTable
+            if (focusedTable?.isEditing == true) {
+                return@invokeLater
+            }
+            refreshRequestDocExampleFromUi()
+        }
+    }
+
+    private fun setupDraftPersistenceListeners() {
+        fun onDraftChanged() {
+            if (isLoading) {
+                return
+            }
+            invalidateTemplatePreviewContext()
+            schedulePersistCurrentTab()
+            scheduleTemplateDecorationsRefresh()
+        }
+
+        listOf(
+            requestVarsModel,
+            pathParamsModel,
+            paramsModel,
+            headersModel,
+            urlEncodedModel,
+            formDataModel,
+            requestDocParamsModel,
+            responseStatusDocsModel,
+            responseDocParamsModel
+        ).forEach { model ->
+            model.addTableModelListener { onDraftChanged() }
+        }
+
+        val swingListener = object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) {
+                if (e.document === urlField.document) {
+                    updateUrlTemplateDecoration()
+                }
+                onDraftChanged()
+            }
+
+            override fun removeUpdate(e: DocumentEvent) {
+                if (e.document === urlField.document) {
+                    updateUrlTemplateDecoration()
+                }
+                onDraftChanged()
+            }
+
+            override fun changedUpdate(e: DocumentEvent) {
+                if (e.document === urlField.document) {
+                    updateUrlTemplateDecoration()
+                }
+                onDraftChanged()
+            }
+        }
+        listOf(urlField, timeoutField, responseDocStatusField, responseDocContentTypeField, responseDocDescriptionField)
+            .forEach { field ->
+                field.document.addDocumentListener(swingListener)
+            }
+
+        val editorListener = object : com.intellij.openapi.editor.event.DocumentListener {
+            override fun documentChanged(event: com.intellij.openapi.editor.event.DocumentEvent) {
+                onDraftChanged()
+            }
+        }
+        listOf(bodyArea, preScriptArea, postScriptArea, requestDocBodyEditor, responseDocBodyEditor)
+            .forEach { editor ->
+                editor.document.addDocumentListener(editorListener)
+            }
+        methodBox.addActionListener { onDraftChanged() }
+        bodyTypeBox.addActionListener { onDraftChanged() }
+    }
+
+    private fun schedulePersistCurrentTab() {
+        if (draftPersistTimer == null) {
+            draftPersistTimer = javax.swing.Timer(
+                350,
+                java.awt.event.ActionListener { flushPersistCurrentTab() }
+            ).apply {
+                isRepeats = false
+            }
+        }
+        draftPersistTimer?.restart()
+    }
+
+    private fun flushPersistCurrentTab() {
+        if (isLoading || persistingCurrentTab) {
+            return
+        }
+        val focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner
+        val focusedTable = SwingUtilities.getAncestorOfClass(JTable::class.java, focusOwner) as? JTable
+        if (focusedTable?.isEditing == true) {
+            if (isShowing) {
+                schedulePersistCurrentTab()
+            }
+            return
+        }
+        persistingCurrentTab = true
+        try {
+            persistCurrentTab()
+        } finally {
+            persistingCurrentTab = false
+        }
+    }
+
+    private fun invalidateTemplatePreviewContext() {
+        templatePreviewContext = null
+    }
+
+    private fun scheduleTemplateDecorationsRefresh() {
+        if (templateDecorationsRefreshScheduled) {
+            return
+        }
+        templateDecorationsRefreshScheduled = true
+        SwingUtilities.invokeLater {
+            templateDecorationsRefreshScheduled = false
+            refreshTemplateDecorations()
+        }
+    }
+
+    private fun refreshTemplateDecorations() {
+        updateUrlTemplateDecoration()
+        templateAwareTables.forEach { table -> table.repaint() }
+    }
+
     fun disposePanel() {
+        flushPersistCurrentTab()
         Disposer.dispose(disposable)
+        draftPersistTimer?.stop()
+        draftPersistTimer = null
         cancelCurrentRequest()
         currentFuture = null
         currentIndicator = null
@@ -304,6 +456,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             apiRequests.clear()
             apiRootNode.removeAllChildren()
             apiTreeModel.reload()
+            requestVarsModel.setRowCount(0)
             paramsModel.setRowCount(0)
             headersModel.setRowCount(0)
             urlEncodedModel.setRowCount(0)
@@ -313,6 +466,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             responseDocParamsModel.setRowCount(0)
             cookiesModel.setRowCount(0)
             cookieEntries.clear()
+            templateAwareTables.clear()
+            tableByModel.clear()
+            invalidateTemplatePreviewContext()
             bodyArea.text = ""
             preScriptArea.text = ""
             postScriptArea.text = ""
@@ -334,6 +490,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             setResponseDownloadEnabled(false)
         } finally {
             isLoading = false
+            invalidateTemplatePreviewContext()
+            scheduleTemplateDecorationsRefresh()
         }
     }
 
@@ -351,7 +509,12 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
         val updated = dialog.toSettings()
         HttpUiSettingsStore.save(project, updated)
+        val variableUpdated = dialog.toVariableTemplateSettings()
+        HttpVariableTemplateSettingsStore.save(project, variableUpdated)
+        variableTemplateSettings = normalizeVariableTemplateSettings(HttpVariableTemplateSettingsStore.load(project))
         applySettings(updated)
+        invalidateTemplatePreviewContext()
+        scheduleTemplateDecorationsRefresh()
     }
 
     fun applySettings(updated: HttpUiSettings) {
@@ -364,6 +527,20 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (oldLineMarkerEnabled != updated.lineMarkerEnabled) {
             DaemonCodeAnalyzer.getInstance(project).restart()
         }
+    }
+
+    fun applyVariableTemplateSettings(updated: HttpVariableTemplateSettings) {
+        variableTemplateSettings = normalizeVariableTemplateSettings(updated)
+        invalidateTemplatePreviewContext()
+        scheduleTemplateDecorationsRefresh()
+    }
+
+    private fun normalizeVariableTemplateSettings(settings: HttpVariableTemplateSettings): HttpVariableTemplateSettings {
+        return settings.copy(
+            templateEnabled = true,
+            unresolvedPolicy = HttpVariableTemplateSettings.UnresolvedPolicy.KEEP.name,
+            unscopedResolveOrder = HttpVariableTemplateSettings.ResolveOrder.REQUEST_PROJECT_GLOBAL.name
+        )
     }
 
     fun addCallTab(draft: HttpRequestDraft, title: String? = null, savedRequestId: Long? = null) {
@@ -528,7 +705,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         actionPanel.add(timeoutPanel)
         requestActionsToolbar = buildActionToolbar(
             "HttpRequestActionsToolbar",
-            listOf(saveApiAction, requestHistoryAction, sendAction, cancelAction, copyCurlAction),
+            listOf(saveApiAction, requestHistoryAction, envSettingsAction, sendAction, cancelAction, copyCurlAction),
             requestPanel
         )
         actionPanel.add(requestActionsToolbar!!.component)
@@ -537,6 +714,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         requestLine.add(urlRow, BorderLayout.NORTH)
         requestLine.add(actionRow, BorderLayout.SOUTH)
 
+        val requestVarsPanel = createKeyValuePanel(requestVarsModel, "接口变量")
         val pathParamsPanel = createKeyValuePanel(pathParamsModel, "路径变量")
         val paramsPanel = createKeyValuePanel(paramsModel, "查询参数")
         val headersPanel = createKeyValuePanel(headersModel, "请求头")
@@ -545,6 +723,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         val cookiesPanel = createCookiePanel()
 
         val requestTabs = JBTabbedPane()
+        requestTabs.addTab("变量", requestVarsPanel)
         requestTabs.addTab("路径变量", pathParamsPanel)
         requestTabs.addTab("参数", paramsPanel)
         requestTabs.addTab("请求头", headersPanel)
@@ -553,6 +732,10 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         requestTabs.addTab("前置脚本", createScriptPanel(preScriptArea, ScriptPhase.PRE))
         requestTabs.addTab("后置脚本", createScriptPanel(postScriptArea, ScriptPhase.POST))
         requestTabs.addTab("接口文档", apiDocPanel)
+        requestTabs.setToolTipTextAt(
+            0,
+            "支持 {{name}}、{{api.name}}、{{project.name}}、{{global.name}}、{{env.name}}、{{path.id}}；鼠标悬浮可查看解析结果"
+        )
 
         responseRenderHtml.isEditable = false
 
@@ -1132,6 +1315,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun persistCurrentTab() {
         val tab = currentTab ?: return
+        commitPendingEditors()
         val draft = resolveDraft(buildDraftFromUI())
         if (tab.draft == draft) {
             return
@@ -1263,6 +1447,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             }
         } finally {
             isLoading = false
+            invalidateTemplatePreviewContext()
+            scheduleTemplateDecorationsRefresh()
         }
     }
 
@@ -1277,6 +1463,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         methodBox.selectedItem = tab.draft.method
         urlField.text = tab.draft.url
         timeoutField.text = sanitizeTimeoutSeconds(tab.draft.timeoutSeconds).toString()
+        setTableEntries(requestVarsModel, tab.draft.requestVars)
         setTableEntries(pathParamsModel, tab.draft.pathParams)
         setTableEntries(paramsModel, tab.draft.params)
         setTableEntries(headersModel, tab.draft.headers)
@@ -1384,6 +1571,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun saveCurrentRequest() {
         val tab = ensureCurrentTab()
+        commitPendingEditors()
         val draft = resolveDraft(buildDraftFromUI())
         val existing = tab.savedRequestId?.let { id -> apiRequests.firstOrNull { it.id == id } }
         val dialog = SaveRequestDialog(project, existing, buildGroupOptions())
@@ -1603,6 +1791,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun cloneDraft(draft: HttpRequestDraft): HttpRequestDraft {
         return draft.copy(
+            requestVars = draft.requestVars.map { it.copy() }.toMutableList(),
             pathParams = draft.pathParams.map { it.copy() }.toMutableList(),
             params = draft.params.map { it.copy() }.toMutableList(),
             headers = draft.headers.map { it.copy() }.toMutableList(),
@@ -1825,6 +2014,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         val method = (methodBox.selectedItem as? String)?.uppercase() ?: "GET"
         val url = urlField.text.trim()
         val timeoutSeconds = resolveTimeoutSeconds(timeoutField.text)
+        val requestVars = getTableEntries(requestVarsModel)
         val pathParams = getTableEntries(pathParamsModel)
         val params = getTableEntries(paramsModel)
         val headers = getTableEntries(headersModel)
@@ -1854,6 +2044,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             url = url,
             path = currentTab?.draft?.path ?: "",
             timeoutSeconds = timeoutSeconds,
+            requestVars = requestVars,
             pathParams = pathParams,
             params = params,
             headers = headers,
@@ -1875,6 +2066,25 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         )
     }
 
+    private fun commitPendingEditors() {
+        if (committingEditors) {
+            return
+        }
+        committingEditors = true
+        try {
+            val focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner
+            val focusedTable = SwingUtilities.getAncestorOfClass(JTable::class.java, focusOwner) as? JTable
+            if (focusedTable != null && focusedTable.isEditing) {
+                val editor = focusedTable.cellEditor
+                if (editor != null && !editor.stopCellEditing()) {
+                    editor.cancelCellEditing()
+                }
+            }
+        } finally {
+            committingEditors = false
+        }
+    }
+
     private fun resolveDraft(draft: HttpRequestDraft): HttpRequestDraft {
         val normalizedUrl = normalizeUrl(draft.url)
         val parts = parseUrl(normalizedUrl)
@@ -1887,13 +2097,14 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun resolveDraftForRequest(draft: HttpRequestDraft): HttpRequestDraft {
-        val normalizedUrl = normalizeUrl(draft.url)
+        val templated = HttpVariableTemplateResolver.resolveDraft(project, draft, variableTemplateSettings)
+        val normalizedUrl = normalizeUrl(templated.url)
         val parts = parseUrl(normalizedUrl)
-        val mergedParams = mergeParams(parts.queryParams, draft.params)
-        val resolvedPath = applyPathVariables(parts.path, draft.pathParams)
+        val mergedParams = mergeParams(parts.queryParams, templated.params)
+        val resolvedPath = applyPathVariables(parts.path, templated.pathParams)
         val baseUrl = replacePathInBaseUrl(parts.baseUrl, parts.path, resolvedPath)
         val finalUrl = buildUrl(baseUrl, mergedParams)
-        return draft.copy(
+        return templated.copy(
             url = finalUrl,
             path = resolvedPath,
             params = mergedParams
@@ -1904,6 +2115,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (isSending) {
             return
         }
+        commitPendingEditors()
         persistCookiesFromTable()
         val tab = ensureCurrentTab()
         val draft = resolveDraft(buildDraftFromUI())
@@ -1932,8 +2144,16 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun copyCurl() {
+        commitPendingEditors()
         val draft = resolveDraft(buildDraftFromUI())
-        val runtimeDraft = resolveDraftForRequest(draft)
+        val runtimeDraft = runCatching { resolveDraftForRequest(draft) }.getOrElse { throwable ->
+            Messages.showErrorDialog(
+                project,
+                throwable.message ?: "变量解析失败",
+                "复制 cURL 失败"
+            )
+            return
+        }
         val curl = buildCurlCommand(runtimeDraft)
         val clipboard = java.awt.Toolkit.getDefaultToolkit().systemClipboard
         clipboard.setContents(java.awt.datatransfer.StringSelection(curl), null)
@@ -2902,11 +3122,271 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         )
     }
 
+    private fun isTemplateAwareModel(model: DefaultTableModel): Boolean {
+        return model === requestVarsModel ||
+            model === pathParamsModel ||
+            model === paramsModel ||
+            model === headersModel ||
+            model === urlEncodedModel ||
+            model === formDataModel ||
+            model === requestDocParamsModel ||
+            model === responseDocParamsModel
+    }
+
+    private fun installTemplateAwareRenderer(table: JTable) {
+        val delegate = table.getDefaultRenderer(Any::class.java)
+        table.setDefaultRenderer(Any::class.java, TableCellRenderer { t, value, isSelected, hasFocus, row, column ->
+            val targetTable = t ?: table
+            val component = delegate.getTableCellRendererComponent(targetTable, value, isSelected, hasFocus, row, column)
+            if (component is JComponent) {
+                val modelColumn = targetTable.convertColumnIndexToModel(column)
+                if (modelColumn == 1) {
+                    applyTemplateCellDecoration(component, targetTable, value?.toString().orEmpty(), isSelected)
+                } else {
+                    resetTemplateCellDecoration(component, targetTable, isSelected)
+                }
+            }
+            component
+        })
+    }
+
+    private fun applyTemplateCellDecoration(component: JComponent, table: JTable, text: String, isSelected: Boolean) {
+        val inspection = inspectTemplateText(text)
+        if (!inspection.hasTemplate()) {
+            resetTemplateCellDecoration(component, table, isSelected)
+            return
+        }
+        component.toolTipText = buildTemplateInspectionTooltip(inspection)
+        if (!isSelected) {
+            component.foreground = if (inspection.hasUnresolved()) TEMPLATE_UNMATCHED_COLOR else TEMPLATE_MATCHED_COLOR
+        }
+    }
+
+    private fun resetTemplateCellDecoration(component: JComponent, table: JTable, isSelected: Boolean) {
+        component.toolTipText = null
+        if (!isSelected) {
+            component.foreground = table.foreground
+        }
+    }
+
+    private fun updateUrlTemplateDecoration() {
+        val inspection = inspectUrlText(urlField.text.trim())
+        if (!inspection.hasTemplate()) {
+            urlField.foreground = defaultUrlFieldForeground
+            urlField.background = defaultUrlFieldBackground
+            urlField.toolTipText = null
+            urlField.putClientProperty("JComponent.outline", null)
+            return
+        }
+        urlField.foreground = if (inspection.hasUnresolved()) TEMPLATE_UNMATCHED_COLOR else TEMPLATE_MATCHED_COLOR
+        urlField.background = if (inspection.hasUnresolved()) URL_UNMATCHED_BACKGROUND else URL_MATCHED_BACKGROUND
+        urlField.toolTipText = buildTemplateInspectionTooltip(inspection)
+        urlField.putClientProperty("JComponent.outline", if (inspection.hasUnresolved()) "error" else null)
+    }
+
+    private fun inspectUrlText(text: String): TemplateInspectionResult {
+        if (text.isBlank()) {
+            return TemplateInspectionResult(emptyList())
+        }
+        val context = templatePreviewContext ?: buildTemplatePreviewContext().also { templatePreviewContext = it }
+        val tokens = mutableListOf<TemplateTokenResult>()
+        if (variableTemplateSettings.templateEnabled && text.contains("{{")) {
+            TEMPLATE_EXPRESSION_REGEX.findAll(text).forEach { match ->
+                val expression = match.groupValues.getOrElse(1) { "" }.trim()
+                tokens.add(resolveTemplateToken(expression, context))
+            }
+        }
+        if (text.contains('{')) {
+            tokens.addAll(inspectPathPlaceholderTokens(text, context))
+        }
+        return TemplateInspectionResult(tokens)
+    }
+
+    private fun inspectTemplateText(text: String): TemplateInspectionResult {
+        if (!variableTemplateSettings.templateEnabled || text.isBlank() || !text.contains("{{")) {
+            return TemplateInspectionResult(emptyList())
+        }
+        val context = templatePreviewContext ?: buildTemplatePreviewContext().also { templatePreviewContext = it }
+        val tokens = TEMPLATE_EXPRESSION_REGEX.findAll(text).map { match ->
+            val expression = match.groupValues.getOrElse(1) { "" }.trim()
+            resolveTemplateToken(expression, context)
+        }.toList()
+        return TemplateInspectionResult(tokens)
+    }
+
+    private fun inspectPathPlaceholderTokens(text: String, context: TemplatePreviewContext): List<TemplateTokenResult> {
+        return URL_PATH_PLACEHOLDER_REGEX.findAll(text).map { match ->
+            val key = match.groupValues.getOrElse(1) { "" }.trim()
+            if (key.isBlank()) {
+                TemplateTokenResult(
+                    expression = "path",
+                    value = null,
+                    source = null,
+                    reason = "路径变量名为空",
+                    displayText = match.value
+                )
+            } else {
+                val value = context.pathVars[key]
+                if (value != null) {
+                    TemplateTokenResult(
+                        expression = "path.$key",
+                        value = value,
+                        source = "路径变量",
+                        reason = null,
+                        displayText = match.value
+                    )
+                } else {
+                    TemplateTokenResult(
+                        expression = "path.$key",
+                        value = null,
+                        source = null,
+                        reason = "路径变量 `$key` 未匹配",
+                        displayText = match.value
+                    )
+                }
+            }
+        }.toList()
+    }
+
+    private fun buildTemplatePreviewContext(): TemplatePreviewContext {
+        val requestVars = getTableEntriesForPreview(requestVarsModel)
+            .filter { it.key.isNotBlank() }
+            .associate { it.key.trim() to it.value }
+        val pathVars = LinkedHashMap<String, String>()
+        getTableEntriesForPreview(pathParamsModel)
+            .filter { it.key.isNotBlank() }
+            .forEach { row ->
+                val key = row.key.trim()
+                if (key.isNotBlank()) {
+                    pathVars[key] = row.value
+                    val unwrapped = key.removePrefix("{").removeSuffix("}").trim()
+                    if (unwrapped.isNotBlank()) {
+                        pathVars.putIfAbsent(unwrapped, row.value)
+                    }
+                }
+            }
+        return TemplatePreviewContext(
+            requestVars = requestVars,
+            pathVars = pathVars,
+            projectEnv = HttpScriptEnvStore.loadProject(project),
+            globalEnv = HttpScriptEnvStore.loadGlobal(),
+            resolveOrder = variableTemplateSettings.resolveOrderEnum()
+        )
+    }
+
+    private fun getTableEntriesForPreview(model: DefaultTableModel): List<HttpKeyValue> {
+        val entries = mutableListOf<HttpKeyValue>()
+        for (row in 0 until model.rowCount) {
+            val key = readTableCellTextForPreview(model, row, 0)
+            val value = readTableCellTextForPreview(model, row, 1)
+            val description = if (model.columnCount > 2) {
+                readTableCellTextForPreview(model, row, 2)
+            } else {
+                ""
+            }
+            if (key.isNotBlank() || value.isNotBlank()) {
+                entries.add(HttpKeyValue(key, value, description))
+            }
+        }
+        return entries
+    }
+
+    private fun readTableCellTextForPreview(model: DefaultTableModel, row: Int, column: Int): String {
+        val table = tableByModel[model]
+        if (table != null && table.model === model && table.isEditing) {
+            val editingRow = table.convertRowIndexToModel(table.editingRow)
+            val editingColumn = table.convertColumnIndexToModel(table.editingColumn)
+            if (editingRow == row && editingColumn == column) {
+                return table.cellEditor?.cellEditorValue?.toString()?.trim().orEmpty()
+            }
+        }
+        return (model.getValueAt(row, column) as? String)?.trim().orEmpty()
+    }
+
+    private fun resolveTemplateToken(expression: String, context: TemplatePreviewContext): TemplateTokenResult {
+        val expr = expression.trim()
+        if (expr.isBlank()) {
+            return TemplateTokenResult(expression = expression, value = null, source = null, reason = "变量表达式为空")
+        }
+        val unscoped = resolveUnscopedTemplate(expr, context)
+        if (unscoped != null) {
+            return TemplateTokenResult(expression = expression, value = unscoped.first, source = unscoped.second, reason = null)
+        }
+        val dot = expr.indexOf('.')
+        if (dot <= 0 || dot >= expr.length - 1) {
+            return TemplateTokenResult(expression = expression, value = null, source = null, reason = "未找到变量值")
+        }
+        val namespace = expr.substring(0, dot).trim().lowercase()
+        val key = expr.substring(dot + 1).trim()
+        if (key.isBlank()) {
+            return TemplateTokenResult(expression = expression, value = null, source = null, reason = "变量名为空")
+        }
+        val resolved = when (namespace) {
+            "env" -> context.projectEnv[key]?.let { it to "项目环境" } ?: context.globalEnv[key]?.let { it to "全局环境" }
+            "project" -> context.projectEnv[key]?.let { it to "项目环境" }
+            "global" -> context.globalEnv[key]?.let { it to "全局环境" }
+            "api", "request", "var", "vars" -> context.requestVars[key]?.let { it to "接口变量" }
+            "path" -> context.pathVars[key]?.let { it to "路径变量" }
+            else -> {
+                return TemplateTokenResult(
+                    expression = expression,
+                    value = null,
+                    source = null,
+                    reason = "未知命名空间 `$namespace`"
+                )
+            }
+        }
+        return if (resolved != null) {
+            TemplateTokenResult(expression = expression, value = resolved.first, source = resolved.second, reason = null)
+        } else {
+            TemplateTokenResult(expression = expression, value = null, source = null, reason = "未找到变量值")
+        }
+    }
+
+    private fun resolveUnscopedTemplate(expr: String, context: TemplatePreviewContext): Pair<String, String>? {
+        return when (context.resolveOrder) {
+            HttpVariableTemplateSettings.ResolveOrder.REQUEST_PROJECT_GLOBAL -> {
+                context.requestVars[expr]?.let { it to "接口变量" }
+                    ?: context.projectEnv[expr]?.let { it to "项目环境" }
+                    ?: context.globalEnv[expr]?.let { it to "全局环境" }
+            }
+            HttpVariableTemplateSettings.ResolveOrder.PROJECT_GLOBAL_REQUEST -> {
+                context.projectEnv[expr]?.let { it to "项目环境" }
+                    ?: context.globalEnv[expr]?.let { it to "全局环境" }
+                    ?: context.requestVars[expr]?.let { it to "接口变量" }
+            }
+        }
+    }
+
+    private fun buildTemplateInspectionTooltip(result: TemplateInspectionResult): String {
+        val lines = result.tokens.map { token ->
+            val expression = StringUtil.escapeXmlEntities(token.displayText)
+            if (token.value != null) {
+                val value = StringUtil.escapeXmlEntities(StringUtil.shortenTextWithEllipsis(token.value, 140, 0))
+                val source = token.source?.let { "（$it）" }.orEmpty()
+                "$expression -> $value$source"
+            } else {
+                val reason = StringUtil.escapeXmlEntities(token.reason ?: "未找到变量值")
+                "$expression -> 未匹配：$reason"
+            }
+        }
+        val orderText = when (variableTemplateSettings.resolveOrderEnum()) {
+            HttpVariableTemplateSettings.ResolveOrder.PROJECT_GLOBAL_REQUEST -> "项目环境 > 全局环境 > 接口变量"
+            HttpVariableTemplateSettings.ResolveOrder.REQUEST_PROJECT_GLOBAL -> "接口变量 > 项目环境 > 全局环境"
+        }
+        return "<html>${lines.joinToString("<br/>")}<br/><br/>默认优先级: ${StringUtil.escapeXmlEntities(orderText)}</html>"
+    }
+
     private fun createKeyValuePanel(model: DefaultTableModel, emptyText: String): JPanel {
         val table = JBTable(model)
         table.emptyText.text = emptyText
         table.rowHeight = JBUI.scale(24)
         table.setShowGrid(false)
+        if (isTemplateAwareModel(model)) {
+            installTemplateAwareRenderer(table)
+            templateAwareTables.add(table)
+        }
+        tableByModel[model] = table
         val addAction = simpleAction("添加", "添加一行", HttpIcons.add) {
             model.addRow(Array(model.columnCount) { "" })
             val row = model.rowCount - 1
@@ -3462,15 +3942,6 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             toolTipText = hint
         }
         header.add(hintLabel, BorderLayout.NORTH)
-        val envAction = object : AnAction("环境变量", "配置全局环境和项目环境", HttpIcons.scriptEnv) {
-            override fun actionPerformed(e: AnActionEvent) {
-                ScriptEnvDialog(project).show()
-            }
-
-            override fun getActionUpdateThread(): ActionUpdateThread {
-                return ActionUpdateThread.EDT
-            }
-        }
         val helpAction = object : AnAction("说明", "查看脚本 API 与返回约定", HttpIcons.scriptHelp) {
             override fun actionPerformed(e: AnActionEvent) {
                 ScriptHelpDialog(project, phase).show()
@@ -3520,7 +3991,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                 return ActionUpdateThread.EDT
             }
         }
-        val toolbar = buildActionToolbar("HttpScriptToolbar", listOf(envAction, helpAction, templateAction, snippetAction), editor)
+        val toolbar = buildActionToolbar("HttpScriptToolbar", listOf(helpAction, templateAction, snippetAction), editor)
         val toolbarWrap = JPanel(BorderLayout())
         toolbarWrap.add(toolbar.component, BorderLayout.EAST)
         header.add(toolbarWrap, BorderLayout.SOUTH)
@@ -4547,6 +5018,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun buildApiDocPanel(): JPanel {
+        val pathParamsDocPanel = createRequestMetaSummaryPanel(pathParamsModel, "暂无路径变量说明")
+        val queryParamsDocPanel = createRequestMetaSummaryPanel(paramsModel, "暂无查询参数说明")
         val requestParamsPanel = createDocKeyValuePanel(requestDocParamsModel, "请求字段")
         val responseStatusPanel = createKeyValuePanel(responseStatusDocsModel, "响应状态码")
         val responseParamsPanel = createDocKeyValuePanel(responseDocParamsModel, "响应字段")
@@ -4589,6 +5062,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
         val requestDocContainer = createDocCardsContainer(
             listOf(
+                createCollapsibleCard("路径变量说明（来自路径变量）", pathParamsDocPanel, collapsedInitially = false),
+                createCollapsibleCard("查询参数说明（来自参数）", queryParamsDocPanel, collapsedInitially = false),
                 createCollapsibleCard("请求参数说明（可编辑）", requestParamsPanel, collapsedInitially = false),
                 createCollapsibleCard("请求示例（JSON 编辑器）", requestExamplePanel, collapsedInitially = false)
             )
@@ -4607,15 +5082,49 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         docTabs.addTab("响应文档", responseDocContainer)
 
         val panel = JPanel(BorderLayout(0, 6))
-        panel.add(JBLabel("说明：请求参数与响应参数已分开展示；每个卡片可单独收起/展开。"), BorderLayout.NORTH)
+        panel.add(JBLabel("说明：请求文档已包含路径变量、查询参数、请求字段；每个卡片可单独收起/展开。"), BorderLayout.NORTH)
         panel.add(docTabs, BorderLayout.CENTER)
         return panel
+    }
+
+    private fun createRequestMetaSummaryPanel(model: DefaultTableModel, emptyText: String): JPanel {
+        val area = createViewerField()
+        fun refresh() {
+            val lines = mutableListOf<String>()
+            for (row in 0 until model.rowCount) {
+                val key = (model.getValueAt(row, 0) as? String)?.trim().orEmpty()
+                val value = (model.getValueAt(row, 1) as? String)?.trim().orEmpty()
+                val description = if (model.columnCount > 2) {
+                    (model.getValueAt(row, 2) as? String)?.trim().orEmpty()
+                } else {
+                    ""
+                }
+                if (key.isBlank() && value.isBlank() && description.isBlank()) {
+                    continue
+                }
+                val descriptionText = description.ifBlank { "无说明" }
+                val exampleSuffix = value.takeIf { it.isNotBlank() }?.let { "；示例: $it" }.orEmpty()
+                lines.add("- $key：$descriptionText$exampleSuffix")
+            }
+            area.text = if (lines.isEmpty()) {
+                emptyText
+            } else {
+                lines.joinToString("\n")
+            }
+        }
+        model.addTableModelListener { refresh() }
+        refresh()
+        return JPanel(BorderLayout()).apply {
+            add(area, BorderLayout.CENTER)
+        }
     }
 
     private fun createFormDataPanel(): JPanel {
         formDataTable = JBTable(formDataModel)
         formDataTable.rowHeight = JBUI.scale(24)
         formDataTable.setShowGrid(false)
+        templateAwareTables.add(formDataTable)
+        tableByModel[formDataModel] = formDataTable
 
         val typeColumn = formDataTable.columnModel.getColumn(2)
         val typeBox = JComboBox(arrayOf("文本", "文件"))
@@ -4626,7 +5135,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         val defaultRenderer = formDataTable.getDefaultRenderer(Any::class.java)
         valueColumn.cellRenderer = TableCellRenderer { table, value, isSelected, hasFocus, row, column ->
             if (!isFileRow(row)) {
-                return@TableCellRenderer defaultRenderer.getTableCellRendererComponent(
+                val component = defaultRenderer.getTableCellRendererComponent(
                     table,
                     value,
                     isSelected,
@@ -4634,6 +5143,10 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                     row,
                     column
                 )
+                if (component is JComponent) {
+                    applyTemplateCellDecoration(component, table, value?.toString().orEmpty(), isSelected)
+                }
+                return@TableCellRenderer component
             }
             val label = JBLabel(fileButtonText(value as? String), HttpIcons.file, SwingConstants.LEFT)
             label.border = JBUI.Borders.empty(0, 4)
@@ -5212,6 +5725,17 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             panel.add(JSeparator(), c)
 
             c.gridy++
+            panel.add(JBLabel("命名空间: {{env.key}} / {{project.key}} / {{global.key}} / {{api.key}} / {{path.id}}"), c)
+
+            c.gridy++
+            panel.add(JButton("变量使用说明").apply {
+                addActionListener { showVariableHelpDialog() }
+            }, c)
+
+            c.gridy++
+            panel.add(JSeparator(), c)
+
+            c.gridy++
             panel.add(proxyEnabledBox, c)
 
             c.gridy++
@@ -5293,6 +5817,37 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             )
         }
 
+        fun toVariableTemplateSettings(): HttpVariableTemplateSettings {
+            return HttpVariableTemplateSettings(
+                templateEnabled = true,
+                unresolvedPolicy = HttpVariableTemplateSettings.UnresolvedPolicy.KEEP.name,
+                unscopedResolveOrder = HttpVariableTemplateSettings.ResolveOrder.REQUEST_PROJECT_GLOBAL.name
+            )
+        }
+
+        private fun showVariableHelpDialog() {
+            object : DialogWrapper(this@HttpClientPanel.project) {
+                init {
+                    title = "变量使用说明"
+                    init()
+                }
+
+                override fun createCenterPanel(): JComponent {
+                    val pane = JTextPane().apply {
+                        contentType = "text/html"
+                        isEditable = false
+                        isOpaque = false
+                        text = VARIABLE_TEMPLATE_HELP_HTML
+                        caretPosition = 0
+                    }
+                    return JPanel(BorderLayout()).apply {
+                        preferredSize = JBUI.size(720, 520)
+                        add(JBScrollPane(pane), BorderLayout.CENTER)
+                    }
+                }
+            }.show()
+        }
+
         private fun updateProxyFieldsEnabled() {
             val enabled = proxyEnabledBox.isSelected
             proxyTypeBox.isEnabled = enabled
@@ -5301,6 +5856,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             proxyUsernameField.isEnabled = enabled
             proxyPasswordField.isEnabled = enabled
         }
+
     }
 
     private inner class ScriptEnvDialog(
@@ -5332,6 +5888,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             val globalValues = readModel(globalModel)
             HttpScriptEnvStore.saveProject(project, projectValues)
             HttpScriptEnvStore.saveGlobal(globalValues)
+            invalidateTemplatePreviewContext()
+            scheduleTemplateDecorationsRefresh()
             super.doOKAction()
         }
 
@@ -5733,6 +6291,34 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
+    private data class TemplatePreviewContext(
+        val requestVars: Map<String, String>,
+        val pathVars: Map<String, String>,
+        val projectEnv: Map<String, String>,
+        val globalEnv: Map<String, String>,
+        val resolveOrder: HttpVariableTemplateSettings.ResolveOrder
+    )
+
+    private data class TemplateTokenResult(
+        val expression: String,
+        val value: String?,
+        val source: String?,
+        val reason: String?,
+        val displayText: String = "{{${expression}}}"
+    )
+
+    private data class TemplateInspectionResult(
+        val tokens: List<TemplateTokenResult>
+    ) {
+        fun hasTemplate(): Boolean {
+            return tokens.isNotEmpty()
+        }
+
+        fun hasUnresolved(): Boolean {
+            return tokens.any { it.value == null }
+        }
+    }
+
     private data class DocFieldPathSegment(
         val name: String,
         val isArray: Boolean,
@@ -5748,6 +6334,33 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     )
 
     companion object {
+        private val TEMPLATE_EXPRESSION_REGEX = Regex("\\{\\{\\s*([^{}]+?)\\s*\\}\\}")
+        private val URL_PATH_PLACEHOLDER_REGEX = Regex("(?<!\\{)\\{\\s*([^{}]+?)\\s*\\}(?!\\})")
+        private val TEMPLATE_MATCHED_COLOR = JBColor(Color(0x1B5E20), Color(0x81C784))
+        private val TEMPLATE_UNMATCHED_COLOR = JBColor(Color(0xB71C1C), Color(0xEF9A9A))
+        private val URL_MATCHED_BACKGROUND = JBColor(Color(0xE8F5E9), Color(0x1F2F23))
+        private val URL_UNMATCHED_BACKGROUND = JBColor(Color(0xFFEBEE), Color(0x3A2222))
+        private val VARIABLE_TEMPLATE_HELP_HTML = """
+            <html>
+            <b>1. 语法</b><br/>
+            - 使用 <code>{{name}}</code> 或 <code>{{namespace.key}}</code>。<br/>
+            - 仅替换 <code>{{...}}</code>，其他文本保持不变。<br/><br/>
+            <b>2. 变量来源</b><br/>
+            - 接口变量：请求页签「变量」中的键值，命名空间 <code>{{api.token}}</code> / <code>{{request.token}}</code> / <code>{{vars.token}}</code>。<br/>
+            - 路径变量：请求页签「路径变量」中的键值，命名空间 <code>{{path.id}}</code>。<br/>
+            - 项目环境：请求区域右上角「环境变量」按钮中的「项目环境」，命名空间 <code>{{project.token}}</code>。<br/>
+            - 全局环境：请求区域右上角「环境变量」按钮中的「全局环境」，命名空间 <code>{{global.token}}</code>。<br/>
+            - env 命名空间：<code>{{env.token}}</code>，读取顺序固定为「项目环境 -> 全局环境」。<br/><br/>
+            <b>3. 无命名空间变量</b><br/>
+            - <code>{{token}}</code> 使用固定优先级：接口变量 -> 项目环境 -> 全局环境。<br/><br/>
+            <b>4. 未解析处理</b><br/>
+            - 保留原文：保持 <code>{{token}}</code> 不变继续发送。<br/>
+            <b>5. 颜色与悬浮提示</b><br/>
+            - 绿色：全部变量匹配成功。<br/>
+            - 红色：存在未匹配变量。<br/>
+            - 鼠标悬浮可查看每个变量的解析值、来源或未匹配原因。<br/>
+            </html>
+        """.trimIndent()
         private val HTTP_METHODS = arrayOf("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
         private val BODY_TYPES = arrayOf(
             BodyTypeOption("无", HttpBodyType.NONE),
@@ -5816,7 +6429,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                env.getGlobal(key): String | null
                env.all(): Map<String, String>
                读取优先级：project > global
-               设置入口：脚本页签右上角“环境变量”按钮
+               设置入口：请求区域右上角“环境变量”按钮
 
             4) vars (临时变量)
                - 类型：Map

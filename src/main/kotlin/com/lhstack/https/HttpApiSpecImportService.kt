@@ -62,6 +62,20 @@ object HttpApiSpecImportService {
         val statusDocs: List<HttpKeyValue> = emptyList()
     )
 
+    private data class SecuritySchemeDef(
+        val name: String,
+        val type: String,
+        val scheme: String,
+        val location: String,
+        val parameterName: String,
+        val description: String
+    )
+
+    private data class SecurityContext(
+        val schemes: Map<String, SecuritySchemeDef>,
+        val globalRequirements: List<Map<String, Any?>>
+    )
+
     fun importFromUrl(project: Project, url: String, rootGroupName: String?, overwriteExisting: Boolean): ImportResult {
         val normalized = url.trim()
         if (normalized.isBlank()) {
@@ -285,6 +299,7 @@ object HttpApiSpecImportService {
 
     private fun parseOpenApi(project: Project, root: Map<String, Any?>): List<ParsedEndpoint> {
         val baseUrl = resolveOpenApiBaseUrl(project, root)
+        val securityContext = buildOpenApiSecurityContext(root)
         val paths = root["paths"].asMap()
         val endpoints = mutableListOf<ParsedEndpoint>()
         paths.forEach { (pathKey, rawPathItem) ->
@@ -309,6 +324,7 @@ object HttpApiSpecImportService {
                     requestBody = requestBody,
                     root = root
                 )
+                applyOperationSecurity(draft, operation, securityContext)
                 applyOpenApiResponseDocumentation(draft, operation, root)
                 endpoints.add(
                     ParsedEndpoint(
@@ -324,6 +340,7 @@ object HttpApiSpecImportService {
 
     private fun parseSwagger(project: Project, root: Map<String, Any?>): List<ParsedEndpoint> {
         val baseUrl = resolveSwaggerBaseUrl(project, root)
+        val securityContext = buildSwaggerSecurityContext(root)
         val paths = root["paths"].asMap()
         val endpoints = mutableListOf<ParsedEndpoint>()
         paths.forEach { (pathKey, rawPathItem) ->
@@ -350,6 +367,7 @@ object HttpApiSpecImportService {
                     consumes = consumes,
                     root = root
                 )
+                applyOperationSecurity(draft, operation, securityContext)
                 applySwaggerResponseDocumentation(draft, operation, root)
                 endpoints.add(
                     ParsedEndpoint(
@@ -361,6 +379,205 @@ object HttpApiSpecImportService {
             }
         }
         return endpoints
+    }
+
+    private fun buildOpenApiSecurityContext(root: Map<String, Any?>): SecurityContext {
+        val schemes = linkedMapOf<String, SecuritySchemeDef>()
+        val securitySchemes = root["components"].asMap()["securitySchemes"].asMap()
+        securitySchemes.forEach { (name, raw) ->
+            val resolved = resolveRefMap(raw.asMap(), root)
+            val parsed = parseSecurityScheme(name, resolved)
+            if (parsed != null) {
+                schemes[name] = parsed
+            }
+        }
+        return SecurityContext(
+            schemes = schemes,
+            globalRequirements = parseSecurityRequirements(root["security"])
+        )
+    }
+
+    private fun buildSwaggerSecurityContext(root: Map<String, Any?>): SecurityContext {
+        val schemes = linkedMapOf<String, SecuritySchemeDef>()
+        val securityDefinitions = root["securityDefinitions"].asMap()
+        securityDefinitions.forEach { (name, raw) ->
+            val resolved = resolveRefMap(raw.asMap(), root)
+            val parsed = parseSecurityScheme(name, resolved)
+            if (parsed != null) {
+                schemes[name] = parsed
+            }
+        }
+        return SecurityContext(
+            schemes = schemes,
+            globalRequirements = parseSecurityRequirements(root["security"])
+        )
+    }
+
+    private fun parseSecurityScheme(name: String, raw: Map<String, Any?>): SecuritySchemeDef? {
+        if (raw.isEmpty()) {
+            return null
+        }
+        val type = raw["type"].asString().lowercase(Locale.ROOT)
+        val description = raw["description"].asString()
+        return when (type) {
+            "http" -> {
+                val scheme = raw["scheme"].asString().lowercase(Locale.ROOT)
+                val normalized = if (scheme.isBlank()) "bearer" else scheme
+                SecuritySchemeDef(
+                    name = name,
+                    type = "http",
+                    scheme = normalized,
+                    location = "header",
+                    parameterName = "Authorization",
+                    description = description
+                )
+            }
+            "basic" -> {
+                SecuritySchemeDef(
+                    name = name,
+                    type = "http",
+                    scheme = "basic",
+                    location = "header",
+                    parameterName = "Authorization",
+                    description = description
+                )
+            }
+            "apikey" -> {
+                val location = raw["in"].asString().lowercase(Locale.ROOT).ifBlank { "header" }
+                val parameterName = raw["name"].asString().ifBlank {
+                    when (location) {
+                        "query" -> "api_key"
+                        "cookie" -> "session"
+                        else -> "X-API-Key"
+                    }
+                }
+                SecuritySchemeDef(
+                    name = name,
+                    type = "apikey",
+                    scheme = "",
+                    location = location,
+                    parameterName = parameterName,
+                    description = description
+                )
+            }
+            "oauth2", "openidconnect" -> {
+                SecuritySchemeDef(
+                    name = name,
+                    type = type,
+                    scheme = "bearer",
+                    location = "header",
+                    parameterName = "Authorization",
+                    description = description
+                )
+            }
+            else -> null
+        }
+    }
+
+    private fun parseSecurityRequirements(raw: Any?): List<Map<String, Any?>> {
+        return raw.asList()
+            .map { it.asMap() }
+            .filter { it.isNotEmpty() }
+    }
+
+    private fun applyOperationSecurity(
+        draft: HttpRequestDraft,
+        operation: Map<String, Any?>,
+        context: SecurityContext
+    ) {
+        val hasOperationSecurity = operation.containsKey("security")
+        val requirements = if (hasOperationSecurity) {
+            parseSecurityRequirements(operation["security"])
+        } else {
+            context.globalRequirements
+        }
+        if (requirements.isEmpty()) {
+            return
+        }
+        requirements.forEach { requirement ->
+            requirement.forEach { (schemeName, rawScopes) ->
+                val scheme = context.schemes[schemeName] ?: return@forEach
+                applySecuritySchemeToDraft(draft, scheme, rawScopes.asStringList())
+            }
+        }
+    }
+
+    private fun applySecuritySchemeToDraft(
+        draft: HttpRequestDraft,
+        scheme: SecuritySchemeDef,
+        scopes: List<String>
+    ) {
+        val scopeSuffix = if (scopes.isEmpty()) "" else "; scopes=${scopes.joinToString(",")}"
+        val descBase = scheme.description.ifBlank { "认证方案 ${scheme.name}" }
+        val desc = "$descBase$scopeSuffix"
+        when (scheme.type) {
+            "http" -> {
+                if (scheme.scheme.equals("basic", ignoreCase = true)) {
+                    upsertHeader(draft, "Authorization", "Basic {{base64(username:password)}}", desc)
+                } else {
+                    upsertHeader(draft, "Authorization", "Bearer {{token}}", desc)
+                }
+            }
+            "oauth2", "openidconnect" -> {
+                upsertHeader(draft, "Authorization", "Bearer {{token}}", desc)
+            }
+            "apikey" -> {
+                when (scheme.location.lowercase(Locale.ROOT)) {
+                    "query" -> upsertQueryParam(draft, scheme.parameterName, "{{apiKey}}", desc)
+                    "cookie" -> upsertCookieHeader(draft, scheme.parameterName, "{{apiKey}}", desc)
+                    else -> upsertHeader(draft, scheme.parameterName, "{{apiKey}}", desc)
+                }
+            }
+        }
+    }
+
+    private fun upsertHeader(draft: HttpRequestDraft, key: String, value: String, description: String) {
+        val existed = draft.headers.firstOrNull { it.key.equals(key, ignoreCase = true) }
+        if (existed == null) {
+            draft.headers.add(HttpKeyValue(key = key, value = value, description = description))
+            return
+        }
+        if (existed.value.isBlank()) {
+            existed.value = value
+        }
+        if (existed.description.isBlank()) {
+            existed.description = description
+        }
+    }
+
+    private fun upsertQueryParam(draft: HttpRequestDraft, key: String, value: String, description: String) {
+        val existed = draft.params.firstOrNull { it.key == key }
+        if (existed == null) {
+            draft.params.add(HttpKeyValue(key = key, value = value, description = description))
+            return
+        }
+        if (existed.value.isBlank()) {
+            existed.value = value
+        }
+        if (existed.description.isBlank()) {
+            existed.description = description
+        }
+    }
+
+    private fun upsertCookieHeader(draft: HttpRequestDraft, cookieName: String, cookieValue: String, description: String) {
+        val existed = draft.headers.firstOrNull { it.key.equals("Cookie", ignoreCase = true) }
+        val cookiePair = "$cookieName=$cookieValue"
+        if (existed == null) {
+            draft.headers.add(HttpKeyValue(key = "Cookie", value = cookiePair, description = description))
+            return
+        }
+        val names = existed.value.split(";")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .map { part -> part.substringBefore("=").trim() }
+            .toSet()
+        if (!names.contains(cookieName)) {
+            existed.value = existed.value.trim().trimEnd(';')
+                .let { if (it.isBlank()) cookiePair else "$it; $cookiePair" }
+        }
+        if (existed.description.isBlank()) {
+            existed.description = description
+        }
     }
 
     private fun buildDraftFromOpenApi(
@@ -1403,6 +1620,7 @@ object HttpApiSpecImportService {
 
     private fun cloneDraft(draft: HttpRequestDraft): HttpRequestDraft {
         return draft.copy(
+            requestVars = draft.requestVars.map { it.copy() }.toMutableList(),
             pathParams = draft.pathParams.map { it.copy() }.toMutableList(),
             params = draft.params.map { it.copy() }.toMutableList(),
             headers = draft.headers.map { it.copy() }.toMutableList(),

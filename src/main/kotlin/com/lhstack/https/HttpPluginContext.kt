@@ -77,6 +77,13 @@ object HttpPluginContext {
         SwingUtilities.invokeLater { panel.applySettings(sanitized) }
     }
 
+    fun updateVariableTemplateSettings(project: Project, settings: HttpVariableTemplateSettings) {
+        HttpVariableTemplateSettingsStore.save(project, settings)
+        val sanitized = HttpVariableTemplateSettingsStore.load(project)
+        val panel = states[project]?.panel ?: return
+        SwingUtilities.invokeLater { panel.applyVariableTemplateSettings(sanitized) }
+    }
+
     fun removeProject(project: Project) {
         states.remove(project)
         HttpUiSettingsStore.clearCache(project)

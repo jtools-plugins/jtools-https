@@ -56,6 +56,8 @@ data class HttpRequestDraft(
     @Attribute var url: String = "",
     @Attribute var path: String = "",
     @Attribute var timeoutSeconds: Int = 10,
+    @XCollection(style = XCollection.Style.v2, elementName = "request-var")
+    var requestVars: MutableList<HttpKeyValue> = mutableListOf(),
     @XCollection(style = XCollection.Style.v2, elementName = "path-param")
     var pathParams: MutableList<HttpKeyValue> = mutableListOf(),
     @XCollection(style = XCollection.Style.v2, elementName = "param")
