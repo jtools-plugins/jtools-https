@@ -184,6 +184,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val bodyCardPanel = JPanel(bodyCardLayout)
     private val bodyArea = MultiLanguageTextField(JsonFileType.INSTANCE, project)
     private val scriptFileType = resolveScriptFileType()
+    private val preScriptEnabledBox = JBCheckBox("启用接口前置脚本", true)
+    private val postScriptEnabledBox = JBCheckBox("启用接口后置脚本", true)
     private val preScriptArea = MultiLanguageTextField(scriptFileType, project)
     private val postScriptArea = MultiLanguageTextField(scriptFileType, project)
     private val requestDocBodyEditor = MultiLanguageTextField(JsonFileType.INSTANCE, project)
@@ -470,6 +472,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             tableByModel.clear()
             invalidateTemplatePreviewContext()
             bodyArea.text = ""
+            preScriptEnabledBox.isSelected = true
+            postScriptEnabledBox.isSelected = true
             preScriptArea.text = ""
             postScriptArea.text = ""
             requestDocBodyEditor.text = ""
@@ -729,8 +733,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         requestTabs.addTab("请求头", headersPanel)
         requestTabs.addTab("请求体", bodyPanel)
         requestTabs.addTab("Cookie", cookiesPanel)
-        requestTabs.addTab("前置脚本", createScriptPanel(preScriptArea, ScriptPhase.PRE))
-        requestTabs.addTab("后置脚本", createScriptPanel(postScriptArea, ScriptPhase.POST))
+        requestTabs.addTab("前置脚本", createScriptPanel(preScriptArea, preScriptEnabledBox, HttpScriptPhase.PRE))
+        requestTabs.addTab("后置脚本", createScriptPanel(postScriptArea, postScriptEnabledBox, HttpScriptPhase.POST))
         requestTabs.addTab("接口文档", apiDocPanel)
         requestTabs.setToolTipTextAt(
             0,
@@ -1512,6 +1516,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         responseDocStatusField.text = tab.draft.responseStatus.ifBlank { responseStatusDocs.firstOrNull()?.key.orEmpty() }
         responseDocContentTypeField.text = tab.draft.responseContentType.ifBlank { "application/json" }
         responseDocDescriptionField.text = tab.draft.responseDescription ?: responseStatusDocs.firstOrNull()?.description.orEmpty()
+        preScriptEnabledBox.isSelected = tab.draft.preScriptEnabled
+        postScriptEnabledBox.isSelected = tab.draft.postScriptEnabled
         preScriptArea.text = tab.draft.preScript ?: ""
         postScriptArea.text = tab.draft.postScript ?: ""
         updateResponse(tabResponses[tab.id])
@@ -2043,6 +2049,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             method = method,
             url = url,
             path = currentTab?.draft?.path ?: "",
+            moduleName = currentTab?.draft?.moduleName.orEmpty(),
             timeoutSeconds = timeoutSeconds,
             requestVars = requestVars,
             pathParams = pathParams,
@@ -2053,6 +2060,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             formFields = formFields,
             requestBodyParams = requestBodyParams,
             body = body,
+            preScriptEnabled = preScriptEnabledBox.isSelected,
+            postScriptEnabled = postScriptEnabledBox.isSelected,
+            codeMeta = currentTab?.draft?.codeMeta,
             preScript = preScriptArea.text,
             postScript = postScriptArea.text,
             responseStatus = responseStatus.ifBlank { responseStatusDocs.firstOrNull()?.key.orEmpty() },
@@ -2241,20 +2251,25 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         draft: HttpRequestDraft,
         vars: MutableMap<String, Any?>
     ): PreScriptResult {
-        val script = draft.preScript?.trim().orEmpty()
-        if (script.isBlank()) {
+        val scripts = resolveScopedScripts(draft, HttpScriptPhase.PRE)
+        if (scripts.isEmpty()) {
             return PreScriptResult(draft = draft)
         }
         val logger = HttpScriptLogger(project)
-        val requestContext = toScriptRequestContext(draft)
-        val execution = executeScript(script, requestContext, null, vars, logger)
-        if (execution.isFailure) {
-            val throwable = execution.exceptionOrNull()
-            val message = scriptErrorMessage("前置脚本失败", throwable)
-            logger.error(message)
-            return PreScriptResult(draft = draft, error = message)
+        var nextDraft = draft
+        scripts.forEach { script ->
+            val requestContext = toScriptRequestContext(nextDraft)
+            val endpointContext = toScriptEndpointContext(nextDraft)
+            val execution = executeScript(script.content, requestContext, null, endpointContext, vars, logger)
+            if (execution.isFailure) {
+                val throwable = execution.exceptionOrNull()
+                val message = scriptErrorMessage("前置脚本失败[${script.label}]", throwable)
+                logger.error(message)
+                return PreScriptResult(draft = nextDraft, error = message)
+            }
+            nextDraft = fromScriptRequestContext(nextDraft, requestContext)
         }
-        return PreScriptResult(draft = fromScriptRequestContext(draft, requestContext))
+        return PreScriptResult(draft = nextDraft)
     }
 
     private fun runPostScript(
@@ -2263,40 +2278,107 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         cookieMutations: List<CookieMutation>,
         vars: MutableMap<String, Any?>
     ): PostScriptResult {
-        val script = draft.postScript?.trim().orEmpty()
-        if (script.isBlank()) {
+        val scripts = resolveScopedScripts(draft, HttpScriptPhase.POST)
+        if (scripts.isEmpty()) {
             return PostScriptResult(snapshot = snapshot, cookieMutations = cookieMutations)
         }
         val logger = HttpScriptLogger(project)
         val requestContext = toScriptRequestContext(draft)
-        val responseContext = toScriptResponseContext(snapshot, cookieMutations)
-        val execution = executeScript(script, requestContext, responseContext, vars, logger)
-        if (execution.isFailure) {
-            val throwable = execution.exceptionOrNull()
-            val message = scriptErrorMessage("后置脚本失败", throwable)
-            logger.error(message)
-            val nextStatusText = if (snapshot.statusText.isBlank()) {
-                message
+        val endpointContext = toScriptEndpointContext(draft)
+        var nextSnapshot = snapshot
+        var nextMutations = cookieMutations
+        val errors = mutableListOf<String>()
+        scripts.forEach { script ->
+            val responseContext = toScriptResponseContext(nextSnapshot, nextMutations)
+            val execution = executeScript(script.content, requestContext, responseContext, endpointContext, vars, logger)
+            if (execution.isFailure) {
+                val throwable = execution.exceptionOrNull()
+                val message = scriptErrorMessage("后置脚本失败[${script.label}]", throwable)
+                logger.error(message)
+                errors.add(message)
             } else {
-                "${snapshot.statusText} | $message"
+                nextSnapshot = fromScriptResponseContext(nextSnapshot, responseContext)
+                nextMutations = toCookieMutations(responseContext, draft.url)
             }
-            return PostScriptResult(snapshot = snapshot.copy(statusText = nextStatusText), cookieMutations = cookieMutations)
         }
-        val nextSnapshot = fromScriptResponseContext(snapshot, responseContext)
-        val nextMutations = toCookieMutations(responseContext, draft.url)
+        if (errors.isNotEmpty()) {
+            val combined = errors.joinToString(" | ")
+            nextSnapshot = nextSnapshot.copy(
+                statusText = if (nextSnapshot.statusText.isBlank()) combined else "${nextSnapshot.statusText} | $combined"
+            )
+        }
         return PostScriptResult(snapshot = nextSnapshot, cookieMutations = nextMutations)
+    }
+
+    private fun resolveScopedScripts(
+        draft: HttpRequestDraft,
+        phase: HttpScriptPhase
+    ): List<ResolvedScopedScript> {
+        val scripts = mutableListOf<ResolvedScopedScript>()
+        HttpScopedScriptStore.loadGlobal(phase)
+            .forEach { addResolvedScopedScript(scripts, it, HttpScriptScope.GLOBAL, "全局") }
+        HttpScopedScriptStore.loadProject(project, phase)
+            .forEach { addResolvedScopedScript(scripts, it, HttpScriptScope.PROJECT, "项目") }
+        val moduleName = draft.moduleName.trim()
+        if (moduleName.isNotBlank()) {
+            HttpScopedScriptStore.loadModule(project, moduleName, phase)
+                .forEach { addResolvedScopedScript(scripts, it, HttpScriptScope.MODULE, "模块($moduleName)") }
+        }
+        val interfaceEnabled = when (phase) {
+            HttpScriptPhase.PRE -> draft.preScriptEnabled
+            HttpScriptPhase.POST -> draft.postScriptEnabled
+        }
+        val interfaceContent = when (phase) {
+            HttpScriptPhase.PRE -> draft.preScript.orEmpty()
+            HttpScriptPhase.POST -> draft.postScript.orEmpty()
+        }.trim()
+        if (interfaceEnabled && interfaceContent.isNotBlank()) {
+            val defaultName = if (phase == HttpScriptPhase.PRE) "接口前置脚本" else "接口后置脚本"
+            scripts.add(
+                ResolvedScopedScript(
+                    scope = HttpScriptScope.INTERFACE,
+                    name = defaultName,
+                    label = "接口/$defaultName",
+                    content = interfaceContent
+                )
+            )
+        }
+        return scripts
+    }
+
+    private fun addResolvedScopedScript(
+        target: MutableList<ResolvedScopedScript>,
+        script: HttpScopedScriptEntry,
+        scope: HttpScriptScope,
+        scopeLabel: String
+    ) {
+        val content = script.content.trim()
+        if (!script.enabled || content.isBlank()) {
+            return
+        }
+        val name = script.name.trim().ifBlank { "未命名脚本" }
+        target.add(
+            ResolvedScopedScript(
+                scope = scope,
+                name = name,
+                label = "$scopeLabel/$name",
+                content = content
+            )
+        )
     }
 
     private fun executeScript(
         script: String,
         requestContext: HttpScriptRequestContext?,
         responseContext: HttpScriptResponseContext?,
+        endpointContext: HttpScriptEndpointContext,
         vars: MutableMap<String, Any?>,
         logger: HttpScriptLogger
     ): Result<Unit> {
         val bindings = linkedMapOf<String, Any?>(
             "request" to requestContext,
             "response" to responseContext,
+            "endpoint" to endpointContext,
             "env" to HttpScriptEnv(project),
             "vars" to vars,
             "store" to HttpScriptStore(project),
@@ -2335,6 +2417,68 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             headers = mutableListOf(),
             body = body ?: statusText
         )
+    }
+
+    private fun toScriptEndpointContext(draft: HttpRequestDraft): HttpScriptEndpointContext {
+        val meta = draft.codeMeta ?: return HttpScriptEndpointContext()
+        val methodAnnotations = annotationsToScriptMap(meta.methodAnnotations)
+        val parameters = linkedMapOf<String, HttpScriptEndpointParameterContext>()
+        meta.parameters.forEachIndexed { index, parameter ->
+            val name = parameter.name.trim().ifBlank { "arg$index" }
+            parameters[name] = HttpScriptEndpointParameterContext(
+                type = parameter.type,
+                annotations = annotationsToScriptMap(parameter.annotations)
+            )
+        }
+        val methodDescriptor = meta.methodDescriptor?.let { descriptor ->
+            linkedMapOf<String, Any?>(
+                "name" to descriptor.name,
+                "declaringClass" to descriptor.declaringClass,
+                "returnType" to descriptor.returnType,
+                "parameterTypes" to descriptor.parameterTypes.toList(),
+                "throwsTypes" to descriptor.throwsTypes.toList(),
+                "modifiers" to descriptor.modifiers.toList()
+            )
+        }
+        val classDescriptor = meta.classDescriptor?.let { descriptor ->
+            linkedMapOf<String, Any?>(
+                "name" to descriptor.name,
+                "qualifiedName" to descriptor.qualifiedName,
+                "superClass" to descriptor.superClass,
+                "interfaces" to descriptor.interfaces.toList(),
+                "modifiers" to descriptor.modifiers.toList(),
+                "annotations" to annotationsToScriptMap(descriptor.annotations)
+            )
+        }
+        return HttpScriptEndpointContext(
+            source = meta.source,
+            methodAnnotations = methodAnnotations,
+            parameters = parameters,
+            methodBody = meta.methodBody,
+            methodDescriptor = methodDescriptor,
+            classDescriptor = classDescriptor
+        )
+    }
+
+    private fun annotationsToScriptMap(
+        annotations: List<HttpScriptAnnotationMeta>
+    ): MutableMap<String, MutableMap<String, String>> {
+        val map = linkedMapOf<String, MutableMap<String, String>>()
+        annotations.forEach { annotation ->
+            val key = annotation.qualifiedName.trim()
+            if (key.isBlank()) {
+                return@forEach
+            }
+            val attrs = linkedMapOf<String, String>()
+            annotation.attributes.forEach { attr ->
+                val attrName = attr.key.trim()
+                if (attrName.isNotBlank()) {
+                    attrs[attrName] = attr.value
+                }
+            }
+            map[key] = attrs
+        }
+        return map
     }
 
     private fun toScriptRequestContext(draft: HttpRequestDraft): HttpScriptRequestContext {
@@ -3927,10 +4071,15 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
-    private fun createScriptPanel(editor: MultiLanguageTextField, phase: ScriptPhase): JPanel {
+    private fun createScriptPanel(
+        editor: MultiLanguageTextField,
+        enabledBox: JBCheckBox,
+        phase: HttpScriptPhase
+    ): JPanel {
+        val phaseLabel = if (phase == HttpScriptPhase.PRE) "前置" else "后置"
         val baseHint = when (phase) {
-            ScriptPhase.PRE -> "发送前执行 JavaScript，可修改 request / vars。"
-            ScriptPhase.POST -> "响应后执行 JavaScript，可修改 response / vars / cookies。"
+            HttpScriptPhase.PRE -> "发送前依次执行：全局 -> 项目 -> 模块 -> 接口，可修改 request / vars。"
+            HttpScriptPhase.POST -> "响应后依次执行：全局 -> 项目 -> 模块 -> 接口，可修改 response / vars / cookies。"
         }
         val hint = if (scriptFileType == PlainTextFileType.INSTANCE) {
             "$baseHint 当前 IDE 未检测到 JS 高亮能力，将以纯文本编辑。"
@@ -3942,6 +4091,43 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             toolTipText = hint
         }
         header.add(hintLabel, BorderLayout.NORTH)
+
+        val globalAction = object : AnAction("全局脚本", "管理全局${phaseLabel}脚本列表", HttpIcons.scriptScopeGlobal) {
+            override fun actionPerformed(e: AnActionEvent) {
+                ScopedScriptManageDialog(project, phase, HttpScriptScope.GLOBAL).show()
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+        val projectAction = object : AnAction("项目脚本", "管理项目${phaseLabel}脚本列表", HttpIcons.scriptScopeProject) {
+            override fun actionPerformed(e: AnActionEvent) {
+                ScopedScriptManageDialog(project, phase, HttpScriptScope.PROJECT).show()
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
+        val moduleAction = object : AnAction("模块脚本", "管理模块${phaseLabel}脚本列表", HttpIcons.scriptScopeModule) {
+            override fun actionPerformed(e: AnActionEvent) {
+                val moduleName = currentTab?.draft?.moduleName?.trim().orEmpty()
+                if (moduleName.isBlank()) {
+                    Messages.showInfoMessage(
+                        project,
+                        "当前请求未绑定模块。\n从代码跳转创建请求后会自动关联模块。",
+                        "模块脚本"
+                    )
+                    return
+                }
+                ScopedScriptManageDialog(project, phase, HttpScriptScope.MODULE, moduleName).show()
+            }
+
+            override fun getActionUpdateThread(): ActionUpdateThread {
+                return ActionUpdateThread.EDT
+            }
+        }
         val helpAction = object : AnAction("说明", "查看脚本 API 与返回约定", HttpIcons.scriptHelp) {
             override fun actionPerformed(e: AnActionEvent) {
                 ScriptHelpDialog(project, phase).show()
@@ -3951,9 +4137,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                 return ActionUpdateThread.EDT
             }
         }
-        val templateAction = object : AnAction("示例", "插入脚本示例", HttpIcons.scriptTemplate) {
+        val templateAction = object : AnAction("示例", "插入接口脚本示例", HttpIcons.scriptTemplate) {
             override fun actionPerformed(e: AnActionEvent) {
-                val template = if (phase == ScriptPhase.PRE) PRE_SCRIPT_TEMPLATE else POST_SCRIPT_TEMPLATE
+                val template = if (phase == HttpScriptPhase.PRE) PRE_SCRIPT_TEMPLATE else POST_SCRIPT_TEMPLATE
                 val current = editor.text.trim()
                 val replace = current.isNotEmpty() &&
                     Messages.showYesNoDialog(
@@ -3969,9 +4155,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                 return ActionUpdateThread.EDT
             }
         }
-        val snippetAction = object : AnAction("片段", "插入变量/函数片段", HttpIcons.scriptSnippet) {
+        val snippetAction = object : AnAction("片段", "插入接口脚本片段", HttpIcons.scriptSnippet) {
             override fun actionPerformed(e: AnActionEvent) {
-                val snippets = if (phase == ScriptPhase.PRE) PRE_SCRIPT_SNIPPETS else POST_SCRIPT_SNIPPETS
+                val snippets = if (phase == HttpScriptPhase.PRE) PRE_SCRIPT_SNIPPETS else POST_SCRIPT_SNIPPETS
                 if (snippets.isEmpty()) {
                     return
                 }
@@ -3991,14 +4177,25 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                 return ActionUpdateThread.EDT
             }
         }
-        val toolbar = buildActionToolbar("HttpScriptToolbar", listOf(helpAction, templateAction, snippetAction), editor)
+        val toolbar = buildActionToolbar(
+            "HttpScriptToolbar.$phase",
+            listOf(globalAction, projectAction, moduleAction, helpAction, templateAction, snippetAction),
+            editor
+        )
         val toolbarWrap = JPanel(BorderLayout())
         toolbarWrap.add(toolbar.component, BorderLayout.EAST)
         header.add(toolbarWrap, BorderLayout.SOUTH)
 
+        val interfaceHeader = JPanel(BorderLayout(6, 0))
+        interfaceHeader.add(enabledBox, BorderLayout.WEST)
+        interfaceHeader.add(JBLabel("接口脚本 (单个)"), BorderLayout.EAST)
+        val editorPanel = JPanel(BorderLayout(0, 6))
+        editorPanel.add(interfaceHeader, BorderLayout.NORTH)
+        editorPanel.add(editor, BorderLayout.CENTER)
+
         val panel = JPanel(BorderLayout(0, 6))
         panel.add(header, BorderLayout.NORTH)
-        panel.add(editor, BorderLayout.CENTER)
+        panel.add(editorPanel, BorderLayout.CENTER)
         return panel
     }
 
@@ -5950,12 +6147,245 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
+    private inner class ScopedScriptManageDialog(
+        project: Project,
+        private val phase: HttpScriptPhase,
+        private val scope: HttpScriptScope,
+        private val moduleName: String = ""
+    ) : DialogWrapper(project) {
+        private val scripts = mutableListOf<HttpScopedScriptEntry>()
+        private val model = object : DefaultTableModel(arrayOf("启用", "名称"), 0) {
+            override fun getColumnClass(columnIndex: Int): Class<*> {
+                return if (columnIndex == 0) java.lang.Boolean::class.java else String::class.java
+            }
+
+            override fun isCellEditable(row: Int, column: Int): Boolean {
+                return true
+            }
+        }
+        private val table = JBTable(model)
+        private val editor = MultiLanguageTextField(scriptFileType, this@HttpClientPanel.project)
+        private var selectedRow = -1
+        private var syncing = false
+
+        init {
+            title = buildDialogTitle()
+            scripts.addAll(loadScripts())
+            init()
+            reloadModel()
+            bindListeners()
+            if (scripts.isNotEmpty()) {
+                table.selectionModel.setSelectionInterval(0, 0)
+            }
+        }
+
+        override fun createCenterPanel(): JComponent {
+            table.rowHeight = JBUI.scale(24)
+            table.setShowGrid(false)
+            table.emptyText.text = "暂无脚本"
+            table.autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN
+            table.columnModel.getColumn(0).apply {
+                minWidth = JBUI.scale(56)
+                maxWidth = JBUI.scale(56)
+                preferredWidth = JBUI.scale(56)
+            }
+            val addAction = simpleAction("新增", "新增脚本", HttpIcons.add) {
+                commitCurrentEditor()
+                scripts.add(
+                    HttpScopedScriptEntry(
+                        name = "脚本${scripts.size + 1}",
+                        enabled = true,
+                        content = ""
+                    )
+                )
+                reloadModel()
+                val row = scripts.lastIndex
+                if (row >= 0) {
+                    table.selectionModel.setSelectionInterval(row, row)
+                }
+            }
+            val removeAction = simpleAction("删除", "删除选中脚本", HttpIcons.remove) {
+                val selected = table.selectedRow
+                if (selected !in scripts.indices) {
+                    return@simpleAction
+                }
+                commitCurrentEditor()
+                scripts.removeAt(selected)
+                reloadModel()
+                if (scripts.isEmpty()) {
+                    selectedRow = -1
+                    editor.text = ""
+                } else {
+                    val next = minOf(selected, scripts.lastIndex)
+                    table.selectionModel.setSelectionInterval(next, next)
+                }
+            }
+            val upAction = object : AnAction("上移", "上移脚本顺序", AllIcons.Actions.MoveUp) {
+                override fun actionPerformed(e: AnActionEvent) {
+                    val row = table.selectedRow
+                    if (row !in scripts.indices || row == 0) {
+                        return
+                    }
+                    commitCurrentEditor()
+                    Collections.swap(scripts, row, row - 1)
+                    reloadModel()
+                    table.selectionModel.setSelectionInterval(row - 1, row - 1)
+                }
+
+                override fun getActionUpdateThread(): ActionUpdateThread {
+                    return ActionUpdateThread.EDT
+                }
+            }
+            val downAction = object : AnAction("下移", "下移脚本顺序", AllIcons.Actions.MoveDown) {
+                override fun actionPerformed(e: AnActionEvent) {
+                    val row = table.selectedRow
+                    if (row !in scripts.indices || row >= scripts.lastIndex) {
+                        return
+                    }
+                    commitCurrentEditor()
+                    Collections.swap(scripts, row, row + 1)
+                    reloadModel()
+                    table.selectionModel.setSelectionInterval(row + 1, row + 1)
+                }
+
+                override fun getActionUpdateThread(): ActionUpdateThread {
+                    return ActionUpdateThread.EDT
+                }
+            }
+            val toolbar = buildActionToolbar(
+                "HttpScopedScriptDialogToolbar.$scope.$phase",
+                listOf(addAction, removeAction, upAction, downAction),
+                table
+            )
+            val split = JBSplitter(false, 0.34f)
+            split.firstComponent = JPanel(BorderLayout(0, 6)).apply {
+                add(toolbar.component, BorderLayout.NORTH)
+                add(JBScrollPane(table), BorderLayout.CENTER)
+            }
+            split.secondComponent = editor
+            split.dividerWidth = JBUI.scale(6)
+            split.proportion = 0.34f
+            return JPanel(BorderLayout(0, 8)).apply {
+                preferredSize = JBUI.size(920, 560)
+                add(JBLabel(buildDialogHint()), BorderLayout.NORTH)
+                add(split, BorderLayout.CENTER)
+            }
+        }
+
+        override fun doOKAction() {
+            commitCurrentEditor()
+            stopTableEditing()
+            saveScripts(scripts)
+            super.doOKAction()
+        }
+
+        private fun buildDialogTitle(): String {
+            val phaseText = if (phase == HttpScriptPhase.PRE) "前置" else "后置"
+            return when (scope) {
+                HttpScriptScope.GLOBAL -> "全局${phaseText}脚本"
+                HttpScriptScope.PROJECT -> "项目${phaseText}脚本"
+                HttpScriptScope.MODULE -> "模块${phaseText}脚本 - $moduleName"
+                HttpScriptScope.INTERFACE -> "接口${phaseText}脚本"
+            }
+        }
+
+        private fun buildDialogHint(): String {
+            val executionOrder = "执行顺序：全局 -> 项目 -> 模块 -> 接口"
+            return when (scope) {
+                HttpScriptScope.GLOBAL -> "$executionOrder；当前正在编辑全局脚本。"
+                HttpScriptScope.PROJECT -> "$executionOrder；当前正在编辑项目脚本。"
+                HttpScriptScope.MODULE -> "$executionOrder；当前模块：$moduleName。"
+                HttpScriptScope.INTERFACE -> "$executionOrder；接口脚本固定为单个，不在此面板编辑。"
+            }
+        }
+
+        private fun bindListeners() {
+            table.selectionModel.addListSelectionListener {
+                if (it.valueIsAdjusting || syncing) {
+                    return@addListSelectionListener
+                }
+                val row = table.selectedRow
+                if (row == selectedRow) {
+                    return@addListSelectionListener
+                }
+                commitCurrentEditor()
+                selectedRow = row
+                editor.text = scripts.getOrNull(row)?.content.orEmpty()
+            }
+            model.addTableModelListener { event ->
+                if (syncing) {
+                    return@addTableModelListener
+                }
+                val first = event.firstRow
+                val last = event.lastRow
+                if (first < 0 || last < 0) {
+                    return@addTableModelListener
+                }
+                for (row in first..last) {
+                    syncRowToScript(row)
+                }
+            }
+        }
+
+        private fun syncRowToScript(row: Int) {
+            val script = scripts.getOrNull(row) ?: return
+            script.enabled = (model.getValueAt(row, 0) as? Boolean) ?: true
+            script.name = (model.getValueAt(row, 1) as? String)?.trim().orEmpty()
+        }
+
+        private fun stopTableEditing() {
+            if (table.isEditing) {
+                table.cellEditor?.stopCellEditing()
+            }
+        }
+
+        private fun commitCurrentEditor() {
+            val row = selectedRow
+            if (row !in scripts.indices) {
+                return
+            }
+            scripts[row].content = editor.text
+            syncRowToScript(row)
+        }
+
+        private fun reloadModel() {
+            stopTableEditing()
+            syncing = true
+            try {
+                model.setRowCount(0)
+                scripts.forEach { script ->
+                    model.addRow(arrayOf(script.enabled, script.name))
+                }
+            } finally {
+                syncing = false
+            }
+        }
+
+        private fun loadScripts(): MutableList<HttpScopedScriptEntry> {
+            return when (scope) {
+                HttpScriptScope.GLOBAL -> HttpScopedScriptStore.loadGlobal(phase)
+                HttpScriptScope.PROJECT -> HttpScopedScriptStore.loadProject(this@HttpClientPanel.project, phase)
+                HttpScriptScope.MODULE -> HttpScopedScriptStore.loadModule(this@HttpClientPanel.project, moduleName, phase)
+                HttpScriptScope.INTERFACE -> mutableListOf()
+            }
+        }
+
+        private fun saveScripts(values: List<HttpScopedScriptEntry>) {
+            when (scope) {
+                HttpScriptScope.GLOBAL -> HttpScopedScriptStore.saveGlobal(phase, values)
+                HttpScriptScope.PROJECT -> HttpScopedScriptStore.saveProject(this@HttpClientPanel.project, phase, values)
+                HttpScriptScope.MODULE -> HttpScopedScriptStore.saveModule(this@HttpClientPanel.project, moduleName, phase, values)
+                HttpScriptScope.INTERFACE -> Unit
+            }
+        }
+    }
+
     private inner class ScriptHelpDialog(
         project: Project,
-        private val phase: ScriptPhase
+        private val phase: HttpScriptPhase
     ) : DialogWrapper(project) {
         init {
-            title = if (phase == ScriptPhase.PRE) "前置脚本说明" else "后置脚本说明"
+            title = if (phase == HttpScriptPhase.PRE) "前置脚本说明" else "后置脚本说明"
             init()
         }
 
@@ -5965,11 +6395,11 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             apiField.setCaretPosition(0)
 
             val phaseField = createViewerField()
-            phaseField.text = if (phase == ScriptPhase.PRE) PRE_SCRIPT_DOC else POST_SCRIPT_DOC
+            phaseField.text = if (phase == HttpScriptPhase.PRE) PRE_SCRIPT_DOC else POST_SCRIPT_DOC
             phaseField.setCaretPosition(0)
 
             val sampleField = createViewerField()
-            sampleField.text = if (phase == ScriptPhase.PRE) PRE_SCRIPT_TEMPLATE else POST_SCRIPT_TEMPLATE
+            sampleField.text = if (phase == HttpScriptPhase.PRE) PRE_SCRIPT_TEMPLATE else POST_SCRIPT_TEMPLATE
             sampleField.setCaretPosition(0)
 
             val tabs = JBTabbedPane()
@@ -6269,13 +6699,15 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
-    private enum class ScriptPhase {
-        PRE,
-        POST
-    }
-
     private data class ScriptSnippet(
         val title: String,
+        val content: String
+    )
+
+    private data class ResolvedScopedScript(
+        val scope: HttpScriptScope,
+        val name: String,
+        val label: String,
         val content: String
     )
 
@@ -6397,6 +6829,8 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             【执行约定】
             - 前置脚本：发送 HTTP 请求之前执行
             - 后置脚本：拿到响应之后执行
+            - 多作用域执行顺序：全局 -> 项目 -> 模块 -> 接口
+            - 仅启用且脚本内容非空时才会执行
             - 返回值：脚本 return 值会被忽略，不需要 return
             - 生效方式：直接修改 request / response / vars 对象
             - 超时：脚本执行超时会报错并写入状态信息
@@ -6464,10 +6898,38 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                var encryptor = AES.ECB.buildEncrypt(env.get("key"));
                var result = encryptor.getBase64();
                vars.cipher = result && result.data ? result.data : String(result);
+
+            8) endpoint (代码来源元数据，只读)
+               source: String，接口来源（METHOD / ROUTER）
+               methodAnnotations: Map<String, Map<String, String>>
+                 - key: 注解全限定名
+                 - value: 注解属性名 -> 属性值
+               parameters: Map<String, {type: String, annotations: Map<String, Map<String, String>>}>
+                 - key: 参数名
+                 - value.type: 参数类型全限定名/规范名
+                 - value.annotations: 参数注解（结构同 methodAnnotations）
+               methodBody: String | null，方法体源码文本
+               methodDescriptor: Map | null
+                 - name: 方法名
+                 - declaringClass: 声明类全限定名
+                 - returnType: 返回值类型
+                 - parameterTypes: 参数类型列表
+                 - throwsTypes: throws 类型列表
+                 - modifiers: 修饰符列表
+               classDescriptor: Map | null
+                 - name / qualifiedName / superClass
+                 - interfaces: 接口全限定名列表
+                 - modifiers: 修饰符列表
+                 - annotations: 类注解（结构同 methodAnnotations）
+
+               默认值说明：
+               - 若请求不是“从代码跳转/添加”生成，methodAnnotations/parameters 为 {}，methodBody/methodDescriptor/classDescriptor 为 null。
+               - 若能解析到方法但缺少某部分信息，则对应字段返回空 Map 或 null，不抛错。
         """.trimIndent()
         private val PRE_SCRIPT_DOC = """
             【前置脚本入参】
             - request: 可读可写
+            - endpoint: 只读（接口源码元数据，见通用 API）
             - env: 只读
             - vars: 可读可写
             - store: 可读可写
@@ -6487,6 +6949,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
             【后置脚本入参】
             - request: 只读参考
             - response: 可读可写
+            - endpoint: 只读（接口源码元数据，见通用 API）
             - env: 只读
             - vars: 可读可写
             - store: 可读可写
@@ -6511,6 +6974,11 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
             vars.traceId = "trace-" + Date.now();
             request.headers["X-Trace-Id"] = vars.traceId;
+
+            // 代码来源接口可读取 endpoint 元数据（非代码来源时为默认空值）
+            if (endpoint.methodDescriptor) {
+              log.info("method=" + endpoint.methodDescriptor.name);
+            }
 
             // 根据 bodyMode 设置请求体
             request.bodyMode = "JSON";

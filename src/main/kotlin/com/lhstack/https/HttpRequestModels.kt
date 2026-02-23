@@ -50,11 +50,65 @@ data class HttpFormField(
     @Attribute var fieldType: String = HttpFormFieldType.TEXT.name
 )
 
+@Tag("annotation-meta")
+data class HttpScriptAnnotationMeta(
+    @Attribute var qualifiedName: String = "",
+    @XCollection(style = XCollection.Style.v2, elementName = "attr")
+    var attributes: MutableList<HttpKeyValue> = mutableListOf()
+)
+
+@Tag("parameter-meta")
+data class HttpScriptParameterMeta(
+    @Attribute var name: String = "",
+    @Attribute var type: String = "",
+    @XCollection(style = XCollection.Style.v2, elementName = "annotation")
+    var annotations: MutableList<HttpScriptAnnotationMeta> = mutableListOf()
+)
+
+@Tag("method-descriptor")
+data class HttpScriptMethodDescriptor(
+    @Attribute var name: String = "",
+    @Attribute var returnType: String = "",
+    @Attribute var declaringClass: String = "",
+    @XCollection(style = XCollection.Style.v2, elementName = "param-type")
+    var parameterTypes: MutableList<String> = mutableListOf(),
+    @XCollection(style = XCollection.Style.v2, elementName = "throw-type")
+    var throwsTypes: MutableList<String> = mutableListOf(),
+    @XCollection(style = XCollection.Style.v2, elementName = "modifier")
+    var modifiers: MutableList<String> = mutableListOf()
+)
+
+@Tag("class-descriptor")
+data class HttpScriptClassDescriptor(
+    @Attribute var name: String = "",
+    @Attribute var qualifiedName: String = "",
+    @Attribute var superClass: String = "",
+    @XCollection(style = XCollection.Style.v2, elementName = "interface")
+    var interfaces: MutableList<String> = mutableListOf(),
+    @XCollection(style = XCollection.Style.v2, elementName = "modifier")
+    var modifiers: MutableList<String> = mutableListOf(),
+    @XCollection(style = XCollection.Style.v2, elementName = "annotation")
+    var annotations: MutableList<HttpScriptAnnotationMeta> = mutableListOf()
+)
+
+@Tag("endpoint-code-meta")
+data class HttpEndpointCodeMeta(
+    @Attribute var source: String = "",
+    @XCollection(style = XCollection.Style.v2, elementName = "method-annotation")
+    var methodAnnotations: MutableList<HttpScriptAnnotationMeta> = mutableListOf(),
+    @XCollection(style = XCollection.Style.v2, elementName = "parameter")
+    var parameters: MutableList<HttpScriptParameterMeta> = mutableListOf(),
+    var methodBody: String? = null,
+    var methodDescriptor: HttpScriptMethodDescriptor? = null,
+    var classDescriptor: HttpScriptClassDescriptor? = null
+)
+
 @Tag("request")
 data class HttpRequestDraft(
     @Attribute var method: String = "GET",
     @Attribute var url: String = "",
     @Attribute var path: String = "",
+    @Attribute var moduleName: String = "",
     @Attribute var timeoutSeconds: Int = 10,
     @XCollection(style = XCollection.Style.v2, elementName = "request-var")
     var requestVars: MutableList<HttpKeyValue> = mutableListOf(),
@@ -72,6 +126,9 @@ data class HttpRequestDraft(
     @XCollection(style = XCollection.Style.v2, elementName = "request-body-param")
     var requestBodyParams: MutableList<HttpKeyValue> = mutableListOf(),
     var body: String? = null,
+    @Attribute var preScriptEnabled: Boolean = true,
+    @Attribute var postScriptEnabled: Boolean = true,
+    var codeMeta: HttpEndpointCodeMeta? = null,
     var preScript: String? = null,
     var postScript: String? = null,
     @Attribute var responseStatus: String = "",

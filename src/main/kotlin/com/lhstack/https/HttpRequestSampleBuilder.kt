@@ -1,6 +1,7 @@
 package com.lhstack.https
 
 import com.intellij.codeInsight.AnnotationUtil
+import com.intellij.openapi.module.ModuleUtilCore
 import com.intellij.psi.JavaPsiFacade
 import com.intellij.psi.PsiAnnotation
 import com.intellij.psi.PsiAnnotationMemberValue
@@ -100,18 +101,121 @@ object HttpRequestSampleBuilder {
         } else {
             mutableListOf()
         }
+        val moduleName = ModuleUtilCore.findModuleForPsiElement(endpoint.anchor)?.name.orEmpty()
+        val codeMeta = buildCodeMeta(endpoint)
 
         return HttpRequestDraft(
             method = endpoint.httpMethod,
             url = url,
             path = templatePath,
+            moduleName = moduleName,
             pathParams = pathParams,
             params = params,
             headers = headers,
             bodyType = bodyType.name,
             formFields = formFields,
-            body = body
+            body = body,
+            codeMeta = codeMeta
         )
+    }
+
+    private fun buildCodeMeta(endpoint: EndpointInfo): HttpEndpointCodeMeta? {
+        val method = endpoint.psiMethod ?: return null
+        val methodAnnotations = method.annotations.mapNotNull { toAnnotationMeta(it) }.toMutableList()
+        val parameters = method.parameterList.parameters.mapIndexed { index, parameter ->
+            HttpScriptParameterMeta(
+                name = parameter.name?.takeIf { it.isNotBlank() } ?: "arg$index",
+                type = parameter.type.canonicalText.orEmpty(),
+                annotations = parameter.annotations.mapNotNull { toAnnotationMeta(it) }.toMutableList()
+            )
+        }.toMutableList()
+        val methodDescriptor = HttpScriptMethodDescriptor(
+            name = method.name,
+            returnType = method.returnType?.canonicalText.orEmpty(),
+            declaringClass = method.containingClass?.qualifiedName.orEmpty(),
+            parameterTypes = method.parameterList.parameters.map { it.type.canonicalText.orEmpty() }.toMutableList(),
+            throwsTypes = method.throwsList.referencedTypes.map { it.canonicalText.orEmpty() }.toMutableList(),
+            modifiers = collectMethodModifiers(method)
+        )
+        val classDescriptor = method.containingClass?.let { psiClass ->
+            HttpScriptClassDescriptor(
+                name = psiClass.name.orEmpty(),
+                qualifiedName = psiClass.qualifiedName.orEmpty(),
+                superClass = psiClass.superClass?.qualifiedName.orEmpty(),
+                interfaces = psiClass.interfaces.mapNotNull { it.qualifiedName }.toMutableList(),
+                modifiers = collectClassModifiers(psiClass),
+                annotations = psiClass.annotations.mapNotNull { toAnnotationMeta(it) }.toMutableList()
+            )
+        }
+        return HttpEndpointCodeMeta(
+            source = endpoint.source.name,
+            methodAnnotations = methodAnnotations,
+            parameters = parameters,
+            methodBody = method.body?.text,
+            methodDescriptor = methodDescriptor,
+            classDescriptor = classDescriptor
+        )
+    }
+
+    private fun toAnnotationMeta(annotation: PsiAnnotation): HttpScriptAnnotationMeta? {
+        val qualifiedName = annotation.qualifiedName?.trim().orEmpty()
+        if (qualifiedName.isBlank()) {
+            return null
+        }
+        val attributes = annotation.parameterList.attributes.mapNotNull { attr ->
+            val attrName = attr.name?.trim().orEmpty().ifBlank { "value" }
+            val attrValue = resolveAnnotationAttributeValue(attr.value)
+            if (attrName.isBlank()) {
+                null
+            } else {
+                HttpKeyValue(key = attrName, value = attrValue)
+            }
+        }.toMutableList()
+        return HttpScriptAnnotationMeta(qualifiedName = qualifiedName, attributes = attributes)
+    }
+
+    private fun resolveAnnotationAttributeValue(value: PsiAnnotationMemberValue?): String {
+        if (value == null) {
+            return ""
+        }
+        val stringValue = resolveStringValue(value)
+        if (stringValue != null) {
+            return stringValue
+        }
+        val constantValue = runCatching {
+            JavaPsiFacade.getInstance(value.project)
+                .constantEvaluationHelper
+                .computeConstantExpression(value)
+        }.getOrNull()
+        return constantValue?.toString() ?: value.text.orEmpty()
+    }
+
+    private fun collectMethodModifiers(method: com.intellij.psi.PsiMethod): MutableList<String> {
+        val candidates = listOf(
+            PsiModifier.PUBLIC,
+            PsiModifier.PROTECTED,
+            PsiModifier.PRIVATE,
+            PsiModifier.STATIC,
+            PsiModifier.FINAL,
+            PsiModifier.ABSTRACT,
+            PsiModifier.SYNCHRONIZED,
+            PsiModifier.NATIVE,
+            PsiModifier.STRICTFP,
+            "default"
+        )
+        return candidates.filter { method.hasModifierProperty(it) }.toMutableList()
+    }
+
+    private fun collectClassModifiers(psiClass: PsiClass): MutableList<String> {
+        val candidates = listOf(
+            PsiModifier.PUBLIC,
+            PsiModifier.PROTECTED,
+            PsiModifier.PRIVATE,
+            PsiModifier.STATIC,
+            PsiModifier.FINAL,
+            PsiModifier.ABSTRACT
+        )
+        return candidates.filter { psiClass.hasModifierProperty(it) }.toMutableList()
     }
 
     private fun resolveParamDescriptor(parameter: PsiParameter, httpMethod: String): ParamDescriptor {

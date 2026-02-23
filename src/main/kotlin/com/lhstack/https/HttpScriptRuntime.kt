@@ -64,6 +64,20 @@ data class HttpScriptResponseContext(
     var cookies: MutableList<HttpScriptCookie> = mutableListOf()
 )
 
+data class HttpScriptEndpointParameterContext(
+    var type: String = "",
+    var annotations: MutableMap<String, MutableMap<String, String>> = linkedMapOf()
+)
+
+data class HttpScriptEndpointContext(
+    var source: String = "",
+    var methodAnnotations: MutableMap<String, MutableMap<String, String>> = linkedMapOf(),
+    var parameters: MutableMap<String, HttpScriptEndpointParameterContext> = linkedMapOf(),
+    var methodBody: String? = null,
+    var methodDescriptor: MutableMap<String, Any?>? = null,
+    var classDescriptor: MutableMap<String, Any?>? = null
+)
+
 @Tag("script-env-state")
 data class HttpScriptEnvState(
     @XCollection(style = XCollection.Style.v2, elementName = "entry")
