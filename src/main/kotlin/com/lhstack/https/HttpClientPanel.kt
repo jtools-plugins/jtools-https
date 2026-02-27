@@ -23,6 +23,7 @@ import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileChooser.FileSaverDescriptor
 import com.intellij.openapi.fileTypes.FileType
 import com.intellij.openapi.fileTypes.FileTypeManager
+import com.intellij.openapi.fileTypes.LanguageFileType
 import com.intellij.openapi.fileTypes.PlainTextFileType
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressIndicator
@@ -255,6 +256,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private var syncingDocEditors = false
     private var docPreviewRefreshScheduled = false
     private var templateDecorationsRefreshScheduled = false
+    private var panelDisposed = false
     private var templatePreviewContext: TemplatePreviewContext? = null
     private val templateAwareTables = mutableListOf<JBTable>()
     private val tableByModel = IdentityHashMap<DefaultTableModel, JTable>()
@@ -421,22 +423,35 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun scheduleTemplateDecorationsRefresh() {
+        if (panelDisposed || project.isDisposed || Disposer.isDisposed(disposable)) {
+            return
+        }
         if (templateDecorationsRefreshScheduled) {
             return
         }
         templateDecorationsRefreshScheduled = true
         SwingUtilities.invokeLater {
             templateDecorationsRefreshScheduled = false
+            if (panelDisposed || project.isDisposed || Disposer.isDisposed(disposable)) {
+                return@invokeLater
+            }
             refreshTemplateDecorations()
         }
     }
 
     private fun refreshTemplateDecorations() {
+        if (panelDisposed || project.isDisposed || Disposer.isDisposed(disposable)) {
+            return
+        }
         updateUrlTemplateDecoration()
         templateAwareTables.forEach { table -> table.repaint() }
     }
 
     fun disposePanel() {
+        if (panelDisposed) {
+            return
+        }
+        panelDisposed = true
         flushPersistCurrentTab()
         Disposer.dispose(disposable)
         draftPersistTimer?.stop()
@@ -495,7 +510,6 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
         } finally {
             isLoading = false
             invalidateTemplatePreviewContext()
-            scheduleTemplateDecorationsRefresh()
         }
     }
 
@@ -507,16 +521,16 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     fun showSettingsDialog() {
-        val dialog = SettingsDialog(project, uiSettings)
+        val currentSettings = HttpUiSettingsStore.load(project)
+        val dialog = SettingsDialog(project, currentSettings)
         if (!dialog.showAndGet()) {
             return
         }
         val updated = dialog.toSettings()
-        HttpUiSettingsStore.save(project, updated)
+        HttpPluginContext.updateSettings(project, updated)
         val variableUpdated = dialog.toVariableTemplateSettings()
         HttpVariableTemplateSettingsStore.save(project, variableUpdated)
         variableTemplateSettings = normalizeVariableTemplateSettings(HttpVariableTemplateSettingsStore.load(project))
-        applySettings(updated)
         invalidateTemplatePreviewContext()
         scheduleTemplateDecorationsRefresh()
     }
@@ -3409,10 +3423,15 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
                     }
                 }
             }
+        val projectEnv = if (panelDisposed || project.isDisposed) {
+            emptyMap()
+        } else {
+            HttpScriptEnvStore.loadProject(project)
+        }
         return TemplatePreviewContext(
             requestVars = requestVars,
             pathVars = pathVars,
-            projectEnv = HttpScriptEnvStore.loadProject(project),
+            projectEnv = projectEnv,
             globalEnv = HttpScriptEnvStore.loadGlobal(),
             resolveOrder = variableTemplateSettings.resolveOrderEnum()
         )
@@ -4202,7 +4221,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
     private fun resolveScriptFileType(): FileType {
         return runCatching {
             FileTypeManager.getInstance().getFileTypeByExtension("js")
-        }.getOrNull()?.takeIf { it != PlainTextFileType.INSTANCE } ?: PlainTextFileType.INSTANCE
+        }.getOrNull()?.takeIf { it is LanguageFileType && it != PlainTextFileType.INSTANCE } ?: PlainTextFileType.INSTANCE
     }
 
     private fun insertScriptText(editor: MultiLanguageTextField, content: String, replace: Boolean) {
@@ -5864,7 +5883,7 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private inner class SettingsDialog(
         project: Project,
-        settings: HttpUiSettings
+        private val settings: HttpUiSettings
     ) : DialogWrapper(project) {
         private val timeoutField = JBTextField(settings.defaultTimeoutSeconds.toString())
         private val rawLimitField = JBTextField(settings.maxRawViewChars.toString())
@@ -6000,9 +6019,9 @@ class HttpClientPanel(private val project: Project) : JPanel(BorderLayout()) {
 
         fun toSettings(): HttpUiSettings {
             return HttpUiSettings(
-                defaultTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: uiSettings.defaultTimeoutSeconds,
-                maxRawViewChars = rawLimitField.text.trim().toIntOrNull() ?: uiSettings.maxRawViewChars,
-                maxRenderChars = renderLimitField.text.trim().toIntOrNull() ?: uiSettings.maxRenderChars,
+                defaultTimeoutSeconds = timeoutField.text.trim().toIntOrNull() ?: settings.defaultTimeoutSeconds,
+                maxRawViewChars = rawLimitField.text.trim().toIntOrNull() ?: settings.maxRawViewChars,
+                maxRenderChars = renderLimitField.text.trim().toIntOrNull() ?: settings.maxRenderChars,
                 lineMarkerEnabled = lineMarkerEnabledBox.isSelected,
                 contextMenuEnabled = contextMenuEnabledBox.isSelected,
                 proxyEnabled = proxyEnabledBox.isSelected,

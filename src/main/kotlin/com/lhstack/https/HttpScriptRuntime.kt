@@ -287,7 +287,8 @@ object HttpScriptEnvStore {
     }
 
     fun loadProject(project: Project): Map<String, String> {
-        val value = PropertiesComponent.getInstance(project).getValue(PROJECT_KEY).orEmpty()
+        val component = projectProperties(project) ?: return emptyMap()
+        val value = component.getValue(PROJECT_KEY).orEmpty()
         return decode(value)
     }
 
@@ -306,9 +307,10 @@ object HttpScriptEnvStore {
     }
 
     fun saveProject(project: Project, values: Map<String, String>) {
+        val component = projectProperties(project) ?: return
         val normalized = normalize(values)
         val encoded = encode(normalized)
-        PropertiesComponent.getInstance(project).setValue(PROJECT_KEY, encoded)
+        component.setValue(PROJECT_KEY, encoded)
     }
 
     fun removeGlobal(key: String) {
@@ -327,10 +329,18 @@ object HttpScriptEnvStore {
     }
 
     private fun updateProject(project: Project, mutator: (MutableMap<String, String>) -> Unit) {
+        val component = projectProperties(project) ?: return
         val map = LinkedHashMap(loadProject(project))
         mutator(map)
         val encoded = encode(map)
-        PropertiesComponent.getInstance(project).setValue(PROJECT_KEY, encoded)
+        component.setValue(PROJECT_KEY, encoded)
+    }
+
+    private fun projectProperties(project: Project): PropertiesComponent? {
+        if (project.isDisposed) {
+            return null
+        }
+        return runCatching { PropertiesComponent.getInstance(project) }.getOrNull()
     }
 
     private fun setValue(map: MutableMap<String, String>, rawKey: String, rawValue: String?) {

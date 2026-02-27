@@ -11,17 +11,20 @@
             <li>Open the <b>HTTP Client</b> tool window (right side or View | Tool Windows).</li>
             <li>Click the gutter icon on Spring Controller methods or use <i>Add to Call List</i> to generate a request; or create a new tab and enter the URL manually.</li>
             <li>Fill params/headers/body and click <b>Send</b>. Save requests to organize them in groups.</li>
+            <li>Configure proxy in <b>Settings | HTTP Client</b> (HTTP/SOCKS) when sending requests or importing remote OpenAPI/Swagger docs.</li>
         </ol>
         <p><b>Response</b></p>
         <ul>
             <li>Raw/Render/Headers views, JSON/XML/HTML/image rendering, and cURL copy.</li>
             <li>Auto-detects local server port from run logs; defaults to 8080 if not detected.</li>
+            <li>Supports configurable HTTP/SOCKS proxy (host/port/username/password).</li>
         </ul>
         <p><b>使用提示</b></p>
         <ul>
             <li>支持从 Spring 注解与 Router Function 识别接口。</li>
             <li>左侧接口列表支持分组、搜索、拖拽排序。</li>
             <li>支持在 Search Everywhere 使用 <b>JTools Http Search</b> 进行接口/注释/参数/方法体代码模糊搜索。</li>
+            <li>可在 <b>设置 | HTTP Client</b> 中配置代理（HTTP/SOCKS），用于请求发送与远程文档导入。</li>
         </ul>
     ]]></description>
 
@@ -31,12 +34,14 @@
         <li>中文：前后置脚本升级为多作用域执行模型，支持按「全局 -> 项目 -> 模块 -> 接口」顺序聚合执行，并自动过滤未启用或空脚本。</li>
         <li>中文：新增全局/项目/模块脚本列表管理，支持新增、删除、编辑、启用/禁用与顺序调整，支持同一作用域下多个脚本同时生效。</li>
         <li>中文：接口级脚本保留单脚本模型，新增接口前置/后置脚本独立启用开关，并与多作用域执行链路协同。</li>
+        <li>中文：新增代理配置能力：可在设置面板中配置 HTTP/SOCKS 代理（地址、端口、用户名、密码），用于请求发送与远程 OpenAPI/Swagger 导入。</li>
         <li>中文：脚本上下文新增 endpoint 变量：对“从代码跳转/添加”的接口提供方法注解映射、参数类型与参数注解映射、方法体、方法描述符、类描述符；非代码来源默认返回空 Map 或 null。</li>
         <li>中文：脚本管理面板重构为左侧脚本列表 + 右侧内容编辑区，优化启用列宽与操作效率。</li>
         <li>中文：新增全局/项目/模块专属脚本图标，提升作用域识别度。</li>
         <li>English: Upgraded pre/post scripts to a scoped execution model that merges scripts in order: global -> project -> module -> interface, skipping disabled/empty entries.</li>
         <li>English: Added list-based management for global/project/module scripts with create, delete, edit, enable/disable, and ordering; multiple scripts can run within the same scope.</li>
         <li>English: Kept interface-level scripting as a single script and added dedicated enable toggles for interface pre/post scripts, integrated with the scoped execution pipeline.</li>
+        <li>English: Added proxy settings in the Settings panel (HTTP/SOCKS, host/port/username/password) for request sending and remote OpenAPI/Swagger import.</li>
         <li>English: Added an endpoint variable to script context for code-origin requests, including method annotation map, parameter type/annotation map, method body, method descriptor, and class descriptor; non-code requests default to empty maps or null.</li>
         <li>English: Refactored the script manager UI to a left script list + right editor layout, with improved enable-column sizing and editing flow.</li>
         <li>English: Added distinct scope icons for global/project/module script actions to improve visual differentiation.</li>

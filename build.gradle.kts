@@ -21,7 +21,6 @@ repositories {
     mavenCentral()
 }
 dependencies {
-    implementation(files("/Users/lhstack/.jtools/sdk/sdk.jar"))
     implementation("org.xerial:sqlite-jdbc:3.46.0.0") {
         // Avoid bundling slf4j classes into the plugin jar; let the IDE provide them.
         exclude(group = "org.slf4j", module = "slf4j-api")
@@ -29,6 +28,7 @@ dependencies {
     implementation("org.openjdk.nashorn:nashorn-core:15.6")
     implementation("com.fasterxml.jackson.core:jackson-databind:2.17.2")
     implementation("org.apache.pdfbox:pdfbox:2.0.31")
+    implementation(files("/Users/hl/.jtools/sdk/sdk.jar"))
     intellijPlatform{
         intellijIdeaCommunity("2022.3")
         bundledPlugin("com.intellij.java")

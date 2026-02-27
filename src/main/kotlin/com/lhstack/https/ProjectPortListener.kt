@@ -34,6 +34,8 @@ class ProjectPortListener(
         Regex("Tomcat started on port(?:\\(s\\))?:?\\s*(\\d+)", RegexOption.IGNORE_CASE),
         Regex("Netty started on port(?:\\(s\\))?:?\\s*(\\d+)", RegexOption.IGNORE_CASE),
         Regex("Started .* on port(?:\\(s\\))?:?\\s*(\\d+)", RegexOption.IGNORE_CASE),
+        // Tomcat startup log, e.g. `Starting ProtocolHandler ["http-nio-8998"]`
+        Regex("""ProtocolHandler\s*\[\s*(?:["'])?[^"'\]]*?-(\d+)(?:["'])?\s*]""", RegexOption.IGNORE_CASE),
         Regex("Listening on port\\s*(\\d+)", RegexOption.IGNORE_CASE),
         Regex("listening on port\\s*(\\d+)", RegexOption.IGNORE_CASE)
     )

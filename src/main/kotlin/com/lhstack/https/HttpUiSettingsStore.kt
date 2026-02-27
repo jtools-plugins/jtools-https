@@ -25,46 +25,23 @@ object HttpUiSettingsStore {
     private val cache = java.util.concurrent.ConcurrentHashMap<Project, HttpUiSettings>()
 
     fun load(project: Project): HttpUiSettings {
-        cache[project]?.let { return it }
         val settings = HttpSqliteDb.withConnection(project) { connection ->
-            connection.prepareStatement(
-                """
-                SELECT
-                    default_timeout_seconds,
-                    max_raw_view_chars,
-                    max_render_chars,
-                    line_marker_enabled,
-                    context_menu_enabled,
-                    proxy_enabled,
-                    proxy_type,
-                    proxy_host,
-                    proxy_port,
-                    proxy_username,
-                    proxy_password
-                FROM ui_settings
-                ORDER BY id
-                LIMIT 1
-                """.trimIndent()
-            ).use { stmt ->
-                stmt.executeQuery().use { rs ->
-                    if (!rs.next()) {
-                        return@withConnection null
-                    }
-                    HttpUiSettings(
-                        defaultTimeoutSeconds = rs.getInt("default_timeout_seconds"),
-                        maxRawViewChars = rs.getInt("max_raw_view_chars"),
-                        maxRenderChars = rs.getInt("max_render_chars"),
-                        lineMarkerEnabled = rs.getInt("line_marker_enabled") != 0,
-                        contextMenuEnabled = rs.getInt("context_menu_enabled") != 0,
-                        proxyEnabled = rs.getInt("proxy_enabled") != 0,
-                        proxyType = rs.getString("proxy_type") ?: "HTTP",
-                        proxyHost = rs.getString("proxy_host") ?: "",
-                        proxyPort = rs.getInt("proxy_port"),
-                        proxyUsername = rs.getString("proxy_username") ?: "",
-                        proxyPassword = rs.getString("proxy_password") ?: ""
-                    )
-                }
-            }
+            val columns = """
+                default_timeout_seconds,
+                max_raw_view_chars,
+                max_render_chars,
+                line_marker_enabled,
+                context_menu_enabled,
+                proxy_enabled,
+                proxy_type,
+                proxy_host,
+                proxy_port,
+                proxy_username,
+                proxy_password
+            """.trimIndent()
+            // Prefer canonical settings row(id=1). Fallback keeps compatibility with legacy rows.
+            readSettings(connection, "SELECT $columns FROM ui_settings WHERE id = 1 LIMIT 1")
+                ?: readSettings(connection, "SELECT $columns FROM ui_settings ORDER BY id LIMIT 1")
         }
         val sanitized = sanitize(settings ?: HttpUiSettings())
         cache[project] = sanitized
@@ -75,37 +52,22 @@ object HttpUiSettingsStore {
         val sanitized = sanitize(settings)
         val now = HttpSqliteDb.nowString()
         HttpSqliteDb.withConnection(project) { connection ->
-            connection.prepareStatement(
+            val updatedRows = connection.prepareStatement(
                 """
-                INSERT INTO ui_settings (
-                    id,
-                    default_timeout_seconds,
-                    max_raw_view_chars,
-                    max_render_chars,
-                    line_marker_enabled,
-                    context_menu_enabled,
-                    proxy_enabled,
-                    proxy_type,
-                    proxy_host,
-                    proxy_port,
-                    proxy_username,
-                    proxy_password,
-                    created_at,
-                    updated_at
-                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    default_timeout_seconds = excluded.default_timeout_seconds,
-                    max_raw_view_chars = excluded.max_raw_view_chars,
-                    max_render_chars = excluded.max_render_chars,
-                    line_marker_enabled = excluded.line_marker_enabled,
-                    context_menu_enabled = excluded.context_menu_enabled,
-                    proxy_enabled = excluded.proxy_enabled,
-                    proxy_type = excluded.proxy_type,
-                    proxy_host = excluded.proxy_host,
-                    proxy_port = excluded.proxy_port,
-                    proxy_username = excluded.proxy_username,
-                    proxy_password = excluded.proxy_password,
-                    updated_at = excluded.updated_at
+                UPDATE ui_settings SET
+                    default_timeout_seconds = ?,
+                    max_raw_view_chars = ?,
+                    max_render_chars = ?,
+                    line_marker_enabled = ?,
+                    context_menu_enabled = ?,
+                    proxy_enabled = ?,
+                    proxy_type = ?,
+                    proxy_host = ?,
+                    proxy_port = ?,
+                    proxy_username = ?,
+                    proxy_password = ?,
+                    updated_at = ?
+                WHERE id = 1
                 """.trimIndent()
             ).use { stmt ->
                 stmt.setInt(1, sanitized.defaultTimeoutSeconds)
@@ -120,8 +82,44 @@ object HttpUiSettingsStore {
                 stmt.setString(10, sanitized.proxyUsername)
                 stmt.setString(11, sanitized.proxyPassword)
                 stmt.setString(12, now)
-                stmt.setString(13, now)
                 stmt.executeUpdate()
+            }
+            if (updatedRows == 0) {
+                connection.prepareStatement(
+                    """
+                    INSERT INTO ui_settings (
+                        id,
+                        default_timeout_seconds,
+                        max_raw_view_chars,
+                        max_render_chars,
+                        line_marker_enabled,
+                        context_menu_enabled,
+                        proxy_enabled,
+                        proxy_type,
+                        proxy_host,
+                        proxy_port,
+                        proxy_username,
+                        proxy_password,
+                        created_at,
+                        updated_at
+                    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """.trimIndent()
+                ).use { stmt ->
+                    stmt.setInt(1, sanitized.defaultTimeoutSeconds)
+                    stmt.setInt(2, sanitized.maxRawViewChars)
+                    stmt.setInt(3, sanitized.maxRenderChars)
+                    stmt.setInt(4, if (sanitized.lineMarkerEnabled) 1 else 0)
+                    stmt.setInt(5, if (sanitized.contextMenuEnabled) 1 else 0)
+                    stmt.setInt(6, if (sanitized.proxyEnabled) 1 else 0)
+                    stmt.setString(7, sanitized.proxyType)
+                    stmt.setString(8, sanitized.proxyHost)
+                    stmt.setInt(9, sanitized.proxyPort)
+                    stmt.setString(10, sanitized.proxyUsername)
+                    stmt.setString(11, sanitized.proxyPassword)
+                    stmt.setString(12, now)
+                    stmt.setString(13, now)
+                    stmt.executeUpdate()
+                }
             }
         }
         cache[project] = sanitized
@@ -159,5 +157,28 @@ object HttpUiSettingsStore {
             proxyPort = proxyPort,
             proxyUsername = proxyUsername
         )
+    }
+
+    private fun readSettings(connection: java.sql.Connection, sql: String): HttpUiSettings? {
+        return connection.prepareStatement(sql).use { stmt ->
+            stmt.executeQuery().use { rs ->
+                if (!rs.next()) {
+                    return@use null
+                }
+                HttpUiSettings(
+                    defaultTimeoutSeconds = rs.getInt("default_timeout_seconds"),
+                    maxRawViewChars = rs.getInt("max_raw_view_chars"),
+                    maxRenderChars = rs.getInt("max_render_chars"),
+                    lineMarkerEnabled = rs.getInt("line_marker_enabled") != 0,
+                    contextMenuEnabled = rs.getInt("context_menu_enabled") != 0,
+                    proxyEnabled = rs.getInt("proxy_enabled") != 0,
+                    proxyType = rs.getString("proxy_type") ?: "HTTP",
+                    proxyHost = rs.getString("proxy_host") ?: "",
+                    proxyPort = rs.getInt("proxy_port"),
+                    proxyUsername = rs.getString("proxy_username") ?: "",
+                    proxyPassword = rs.getString("proxy_password") ?: ""
+                )
+            }
+        }
     }
 }

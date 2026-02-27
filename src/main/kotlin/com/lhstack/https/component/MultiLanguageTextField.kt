@@ -9,6 +9,7 @@ import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.fileTypes.FileType
 import com.intellij.openapi.fileTypes.LanguageFileType
+import com.intellij.openapi.fileTypes.PlainTextFileType
 import com.intellij.openapi.project.Project
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.codeStyle.CodeStyleManager
@@ -61,7 +62,10 @@ class MultiLanguageTextField(
     init {
         border = JBUI.Borders.customLine(JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground(), 1)
 
-        val language = (fileType as? LanguageFileType)?.language ?: Language.ANY
+        val plainTextLanguage = PlainTextFileType.INSTANCE.language
+        val language = ((fileType as? LanguageFileType)?.language ?: plainTextLanguage)
+            .takeIf { it != Language.ANY }
+            ?: plainTextLanguage
         languageTextField = object : LanguageTextField(language, project, initialText, false) {
             override fun createEditor(): EditorEx {
                 val editor = super.createEditor()
